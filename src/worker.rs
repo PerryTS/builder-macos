@@ -9,6 +9,37 @@ use std::sync::Arc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
+/// Download a base64-encoded tarball from the hub and write the decoded bytes to a temp file.
+async fn download_tarball(url: &str, job_id: &str) -> Result<PathBuf, String> {
+    let resp = reqwest::get(url)
+        .await
+        .map_err(|e| format!("HTTP request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Hub returned HTTP {}", resp.status()));
+    }
+
+    let b64_text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read tarball response body: {e}"))?;
+
+    use base64::Engine;
+    let tarball_bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64_text.trim())
+        .map_err(|e| format!("Failed to base64-decode tarball: {e}"))?;
+
+    let dl_dir = std::env::temp_dir().join("perry-worker-dl");
+    std::fs::create_dir_all(&dl_dir)
+        .map_err(|e| format!("Failed to create download dir: {e}"))?;
+
+    let tarball_path = dl_dir.join(format!("{job_id}.tar.gz"));
+    std::fs::write(&tarball_path, &tarball_bytes)
+        .map_err(|e| format!("Failed to write tarball to disk: {e}"))?;
+
+    Ok(tarball_path)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HubMessage {
@@ -16,7 +47,7 @@ pub enum HubMessage {
         job_id: String,
         manifest: serde_json::Value,
         credentials: serde_json::Value,
-        tarball_path: String,
+        tarball_url: String,
     },
     Cancel {
         job_id: String,
@@ -107,7 +138,7 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
                 job_id,
                 manifest,
                 credentials,
-                tarball_path,
+                tarball_url,
             } => {
                 tracing::info!(job_id = %job_id, "Received job assignment");
 
@@ -169,10 +200,37 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
                         }
                     };
 
+                // Download tarball from hub
+                let tarball_path = match download_tarball(&tarball_url, &job_id).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let err_msg = format!("Failed to download tarball: {e}");
+                        tracing::error!(job_id = %job_id, "{err_msg}");
+                        let error_json = serde_json::to_string(&ServerMessage::Error {
+                            code: ErrorCode::InternalError,
+                            message: err_msg,
+                            stage: None,
+                        })
+                        .unwrap();
+                        let _ = write.send(Message::Text(error_json.into())).await;
+                        let complete_json =
+                            serde_json::to_string(&serde_json::json!({
+                                "type": "complete",
+                                "job_id": job_id,
+                                "success": false,
+                                "duration_secs": 0.0,
+                                "artifacts": []
+                            }))
+                            .unwrap();
+                        let _ = write.send(Message::Text(complete_json.into())).await;
+                        continue;
+                    }
+                };
+
                 let request = BuildRequest {
                     manifest,
                     credentials,
-                    tarball_path: PathBuf::from(tarball_path),
+                    tarball_path,
                     job_id: job_id.clone(),
                 };
 
@@ -194,6 +252,8 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
                         progress_tx,
                     )
                     .await;
+                    // Clean up downloaded tarball
+                    std::fs::remove_file(&request.tarball_path).ok();
                     let _ = build_result_tx.send(result);
                 });
 

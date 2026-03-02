@@ -13,7 +13,7 @@ impl WorkerConfig {
     pub fn from_env() -> Self {
         Self {
             hub_ws_url: env::var("PERRY_HUB_URL")
-                .unwrap_or_else(|_| "ws://localhost:3457".into()),
+                .unwrap_or_else(|_| "wss://hub.perryts.com/ws".into()),
             perry_binary: env::var("PERRY_BUILD_PERRY_BINARY")
                 .unwrap_or_else(|_| "perry".into()),
             android_home: env::var("PERRY_BUILD_ANDROID_HOME")
