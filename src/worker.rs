@@ -9,6 +9,42 @@ use std::sync::Arc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
+/// Upload a built artifact to the hub via HTTP POST (base64-encoded body).
+async fn upload_artifact(
+    url: &str,
+    artifact_path: &std::path::Path,
+    artifact_name: &str,
+    sha256: &str,
+    target: &str,
+) -> Result<serde_json::Value, String> {
+    use base64::Engine;
+    let data =
+        std::fs::read(artifact_path).map_err(|e| format!("Failed to read artifact: {e}"))?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(url)
+        .header("Content-Type", "text/plain")
+        .header("x-artifact-name", artifact_name)
+        .header("x-artifact-sha256", sha256)
+        .header("x-artifact-target", target)
+        .body(b64)
+        .send()
+        .await
+        .map_err(|e| format!("Artifact upload failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Hub returned HTTP {status} for artifact upload: {body}"));
+    }
+
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("Failed to parse upload response: {e}"))
+}
+
 /// Download a base64-encoded tarball from the hub and write the decoded bytes to a temp file.
 async fn download_tarball(url: &str, job_id: &str) -> Result<PathBuf, String> {
     let resp = reqwest::get(url)
@@ -48,6 +84,8 @@ pub enum HubMessage {
         manifest: serde_json::Value,
         credentials: serde_json::Value,
         tarball_url: String,
+        #[serde(default)]
+        artifact_upload_url: Option<String>,
     },
     Cancel {
         job_id: String,
@@ -139,6 +177,7 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
                 manifest,
                 credentials,
                 tarball_url,
+                artifact_upload_url,
             } => {
                 tracing::info!(job_id = %job_id, "Received job assignment");
 
@@ -226,6 +265,8 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
                         continue;
                     }
                 };
+
+                let build_target = manifest.targets.first().cloned().unwrap_or_else(|| "macos".into());
 
                 let request = BuildRequest {
                     manifest,
@@ -350,18 +391,43 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
                         let metadata = std::fs::metadata(&artifact_path).ok();
                         let size = metadata.map(|m| m.len()).unwrap_or(0);
                         let sha256 = compute_sha256(&artifact_path).unwrap_or_default();
+                        let target = build_target.as_str();
 
-                        // Send artifact_ready to hub
-                        let artifact_msg = serde_json::to_string(&serde_json::json!({
-                            "type": "artifact_ready",
-                            "job_id": job_id,
-                            "path": artifact_path.to_string_lossy(),
-                            "artifact_name": artifact_name,
-                            "sha256": sha256,
-                            "size": size,
-                        }))
-                        .unwrap();
-                        let _ = write.send(Message::Text(artifact_msg.into())).await;
+                        // Upload artifact to hub via HTTP (hub notifies CLI clients)
+                        if let Some(ref upload_url) = artifact_upload_url {
+                            match upload_artifact(upload_url, &artifact_path, &artifact_name, &sha256, target).await {
+                                Ok(resp) => {
+                                    tracing::info!(job_id = %job_id, "Artifact uploaded: {}", resp);
+                                }
+                                Err(e) => {
+                                    tracing::error!(job_id = %job_id, "Artifact upload failed: {e}");
+                                    let error_msg = serde_json::to_string(&serde_json::json!({
+                                        "type": "error",
+                                        "job_id": job_id,
+                                        "code": "INTERNAL_ERROR",
+                                        "message": format!("Artifact upload failed: {e}"),
+                                    }))
+                                    .unwrap();
+                                    let _ = write.send(Message::Text(error_msg.into())).await;
+                                }
+                            }
+                        } else {
+                            // Fallback: send artifact_ready via WS (self-hosted / same-machine)
+                            let artifact_msg = serde_json::to_string(&serde_json::json!({
+                                "type": "artifact_ready",
+                                "job_id": job_id,
+                                "target": target,
+                                "path": artifact_path.to_string_lossy(),
+                                "artifact_name": artifact_name,
+                                "sha256": sha256,
+                                "size": size,
+                            }))
+                            .unwrap();
+                            let _ = write.send(Message::Text(artifact_msg.into())).await;
+                        }
+
+                        // Clean up local artifact file
+                        std::fs::remove_file(&artifact_path).ok();
 
                         // Send complete
                         let complete_msg = serde_json::to_string(&serde_json::json!({
