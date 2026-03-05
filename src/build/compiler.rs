@@ -34,6 +34,7 @@ pub async fn compile(
     }
 
     cmd.current_dir(project_dir)
+        .env_remove("RUST_LOG") // Don't inherit Cranelift tracing into perry subprocess
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
