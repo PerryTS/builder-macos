@@ -224,27 +224,29 @@ async fn run_macos_pipeline(
         let has_creds = request.credentials.apple_key_id.is_some()
             && request.credentials.apple_issuer_id.is_some()
             && request.credentials.apple_p8_key.is_some();
-        if has_creds {
-            send_stage(progress, StageName::Publishing, "Uploading to App Store Connect");
-            check_cancelled(cancelled)?;
-            let result = appstore::upload_macos_to_appstore(
-                &pkg_path,
-                request.credentials.apple_p8_key.as_deref().unwrap(),
-                request.credentials.apple_key_id.as_deref().unwrap(),
-                request.credentials.apple_issuer_id.as_deref().unwrap(),
-                tmpdir,
-            )
-            .await?;
-            let _ = progress.send(ServerMessage::Published {
-                platform: "macos".into(),
-                message: result.message,
-                url: None,
-            });
-            send_progress(progress, StageName::Publishing, 100, None);
-        } else {
-            send_stage(progress, StageName::Publishing, "Skipping App Store upload (no API credentials)");
-            send_progress(progress, StageName::Publishing, 100, None);
+        if !has_creds {
+            return Err(
+                "macos.distribute = \"appstore\" requires App Store Connect API credentials. \
+                 Run `perry setup macos` or pass --apple-key-id / --apple-issuer-id / --apple-p8-key."
+                    .to_string(),
+            );
         }
+        send_stage(progress, StageName::Publishing, "Uploading to App Store Connect");
+        check_cancelled(cancelled)?;
+        let result = appstore::upload_macos_to_appstore(
+            &pkg_path,
+            request.credentials.apple_p8_key.as_deref().unwrap(),
+            request.credentials.apple_key_id.as_deref().unwrap(),
+            request.credentials.apple_issuer_id.as_deref().unwrap(),
+            tmpdir,
+        )
+        .await?;
+        let _ = progress.send(ServerMessage::Published {
+            platform: "macos".into(),
+            message: result.message,
+            url: None,
+        });
+        send_progress(progress, StageName::Publishing, 100, None);
 
         let artifact_path = copy_artifact(&pkg_path, &request.manifest.app_name, &request.job_id, "pkg")?;
         Ok(artifact_path)
@@ -410,15 +412,19 @@ async fn run_ios_pipeline(
     let has_appstore_creds = request.credentials.apple_key_id.is_some()
         && request.credentials.apple_issuer_id.is_some()
         && request.credentials.apple_p8_key.is_some();
-    let should_upload = has_appstore_creds
-        && request
-            .manifest
-            .ios_distribute
-            .as_deref()
-            .map(|d| d == "appstore" || d == "testflight")
-            .unwrap_or(false);
+    let ios_distribute = request.manifest.ios_distribute.as_deref();
+    let wants_upload = ios_distribute
+        .map(|d| d == "appstore" || d == "testflight")
+        .unwrap_or(false);
 
-    if should_upload {
+    if wants_upload {
+        if !has_appstore_creds {
+            return Err(format!(
+                "ios.distribute = \"{}\" requires App Store Connect API credentials. \
+                 Run `perry setup ios` or pass --apple-key-id / --apple-issuer-id / --apple-p8-key.",
+                ios_distribute.unwrap_or("")
+            ));
+        }
         send_stage(progress, StageName::Publishing, "Uploading to App Store Connect");
         check_cancelled(cancelled)?;
 
@@ -441,7 +447,7 @@ async fn run_ios_pipeline(
         send_stage(
             progress,
             StageName::Publishing,
-            "Skipping App Store upload (no credentials or distribute not set)",
+            "Skipping App Store upload (distribute not set)",
         );
         send_progress(progress, StageName::Publishing, 100, None);
     }
@@ -507,7 +513,12 @@ async fn run_android_pipeline(
         tmpdir,
     )?;
 
-    let is_playstore = request.manifest.android_distribute.as_deref() == Some("playstore");
+    let is_playstore = request
+        .manifest
+        .android_distribute
+        .as_deref()
+        .map(|d| d == "playstore" || d.starts_with("playstore:"))
+        .unwrap_or(false);
 
     // Create a broadcast sender for the android build (Gradle streaming)
     let (gradle_tx, _) = tokio::sync::broadcast::channel(256);
@@ -565,38 +576,29 @@ async fn run_android_pipeline(
         send_stage(progress, StageName::Publishing, "Uploading to Google Play");
         check_cancelled(cancelled)?;
 
-        let play_track = request
-            .manifest
-            .android_distribute
-            .as_deref()
-            .and_then(|d| {
-                // If distribute is "playstore", default track is "internal"
-                // Could be extended to parse "playstore:beta" etc.
-                if d == "playstore" { Some("internal") } else { None }
-            })
-            .unwrap_or("internal");
+        let distribute_str = request.manifest.android_distribute.as_deref().unwrap_or("playstore");
+        let play_track = parse_playstore_track(request.manifest.android_distribute.as_deref())
+            .ok_or_else(|| {
+                format!(
+                    "Invalid Play Store track in distribute = \"{distribute_str}\". \
+                     Valid: playstore, playstore:internal, playstore:alpha, playstore:beta, playstore:production"
+                )
+            })?;
 
-        match playstore::upload_to_playstore(
+        let play_result = playstore::upload_to_playstore(
             &final_artifact,
             &request.manifest.bundle_id,
             request.credentials.google_play_service_account_json.as_deref(),
             play_track,
-        ).await {
-            Ok(result) => {
-                let _ = progress.send(ServerMessage::Published {
-                    platform: "android".into(),
-                    message: result.message,
-                    url: None,
-                });
-            }
-            Err(e) => {
-                let _ = progress.send(ServerMessage::Log {
-                    stage: StageName::Publishing,
-                    line: format!("Play Store upload skipped: {e}"),
-                    stream: crate::ws::messages::LogStream::Stderr,
-                });
-            }
-        }
+        )
+        .await
+        .map_err(|e| format!("Google Play upload failed: {e}"))?;
+
+        let _ = progress.send(ServerMessage::Published {
+            platform: "android".into(),
+            message: play_result.message,
+            url: None,
+        });
         send_progress(progress, StageName::Publishing, 100, None);
     } else {
         send_stage(
@@ -732,6 +734,28 @@ async fn query_sdk_info() -> ios::SdkInfo {
         xcode: dt_xcode,
         xcode_build: dt_xcode_build,
     }
+}
+
+/// Parse the Play Store track from a `distribute` field value.
+///
+/// - `"playstore"` → `Some("internal")` (default track)
+/// - `"playstore:beta"` → `Some("beta")`
+/// - anything else → `None`
+fn parse_playstore_track(distribute: Option<&str>) -> Option<&'static str> {
+    let d = distribute?;
+    if d == "playstore" {
+        return Some("internal");
+    }
+    if let Some(track) = d.strip_prefix("playstore:") {
+        return match track {
+            "internal" => Some("internal"),
+            "alpha" => Some("alpha"),
+            "beta" => Some("beta"),
+            "production" => Some("production"),
+            _ => None, // invalid track — caught by pre-flight validation in perry CLI
+        };
+    }
+    None
 }
 
 fn base64_decode(input: &str) -> Result<Vec<u8>, String> {

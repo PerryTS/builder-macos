@@ -6,6 +6,71 @@
 use std::path::Path;
 use tokio::process::Command;
 
+/// Maps known altool ITMS error codes and patterns to friendly, actionable messages.
+///
+/// Scans combined stdout+stderr for known patterns and returns a human-readable
+/// error message with the raw output appended for debugging.
+pub fn translate_altool_error(stdout: &str, stderr: &str) -> String {
+    let combined = format!("{stdout}\n{stderr}");
+
+    let guidance = if combined.contains("ITMS-90062") {
+        Some(
+            "Invalid provisioning profile — regenerate an App Store profile at \
+             https://developer.apple.com/account/resources/profiles/list",
+        )
+    } else if combined.contains("ITMS-90161") {
+        Some("Missing app icon — a 1024×1024 PNG with no alpha channel is required")
+    } else if combined.contains("ITMS-90096") {
+        Some(
+            "App not found in App Store Connect — create an app record first at \
+             https://appstoreconnect.apple.com/apps",
+        )
+    } else if combined.contains("ITMS-90174") {
+        Some(
+            "Invalid signing — use an Apple Distribution certificate and check its expiry at \
+             https://developer.apple.com",
+        )
+    } else if combined.contains("ITMS-90165") {
+        Some(
+            "Invalid API key — verify Key ID, Issuer ID, and App Manager role at \
+             https://appstoreconnect.apple.com/access/integrations/api",
+        )
+    } else if combined.contains("ITMS-90034") {
+        Some("Invalid version format — use a format like 1.0.0")
+    } else if combined.contains("ITMS-90060") {
+        Some(
+            "Build number must be higher than the previous upload — \
+             increment build_number in perry.toml",
+        )
+    } else if combined.contains("No suitable application records") {
+        Some(
+            "No App Store Connect app found for this bundle ID — \
+             create the app record first at https://appstoreconnect.apple.com/apps",
+        )
+    } else if combined.contains("401 Unauthorized")
+        || combined.contains("Error: 401")
+        || combined.contains("HTTP 401")
+        || combined.contains("status 401")
+    {
+        Some("API authentication failed — check .p8 key, Key ID, and Issuer ID")
+    } else {
+        None
+    };
+
+    match guidance {
+        Some(msg) => format!(
+            "App Store upload failed: {msg}\n\nRaw output:\nstdout: {}\nstderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        ),
+        None => format!(
+            "App Store upload failed:\nstdout: {}\nstderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        ),
+    }
+}
+
 /// Upload an .ipa to App Store Connect using xcrun altool.
 ///
 /// The .p8 key is temporarily written to disk for altool, then immediately deleted.
@@ -53,11 +118,7 @@ pub async fn upload_to_appstore(
         let _ = std::fs::remove_dir_all(&private_keys_dir);
         let stderr = String::from_utf8_lossy(&validate_output.stderr);
         let stdout = String::from_utf8_lossy(&validate_output.stdout);
-        return Err(format!(
-            "App validation failed:\n{}\n{}",
-            stderr.trim(),
-            stdout.trim()
-        ));
+        return Err(translate_altool_error(&stdout, &stderr));
     }
 
     // Upload the IPA
@@ -95,11 +156,7 @@ pub async fn upload_to_appstore(
         || upload_stderr.contains("Failed")
         || upload_stderr.contains("ERROR ITMS")
     {
-        return Err(format!(
-            "App Store upload failed:\nstdout: {}\nstderr: {}",
-            upload_stdout.trim(),
-            upload_stderr.trim()
-        ));
+        return Err(translate_altool_error(&upload_stdout, &upload_stderr));
     }
 
     Ok(UploadResult {
@@ -109,6 +166,74 @@ pub async fn upload_to_appstore(
 
 pub struct UploadResult {
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_translate_itms_90062() {
+        let msg = translate_altool_error("ERROR ITMS-90062: invalid profile", "");
+        assert!(msg.contains("provisioning profile"), "{msg}");
+        assert!(msg.contains("developer.apple.com"), "{msg}");
+        assert!(msg.contains("Raw output"), "{msg}");
+    }
+
+    #[test]
+    fn test_translate_itms_90096() {
+        let msg = translate_altool_error("", "ERROR ITMS-90096: app not found");
+        assert!(msg.contains("App not found"), "{msg}");
+        assert!(msg.contains("appstoreconnect.apple.com/apps"), "{msg}");
+    }
+
+    #[test]
+    fn test_translate_itms_90165() {
+        let msg = translate_altool_error("ERROR ITMS-90165: invalid key", "");
+        assert!(msg.contains("Invalid API key"), "{msg}");
+        assert!(msg.contains("access/integrations/api"), "{msg}");
+    }
+
+    #[test]
+    fn test_translate_itms_90060() {
+        let msg = translate_altool_error("ERROR ITMS-90060: build number too low", "");
+        assert!(msg.contains("Build number"), "{msg}");
+        assert!(msg.contains("perry.toml"), "{msg}");
+    }
+
+    #[test]
+    fn test_translate_no_suitable_application_records() {
+        let msg = translate_altool_error("No suitable application records were found", "");
+        assert!(msg.contains("bundle ID"), "{msg}");
+    }
+
+    #[test]
+    fn test_translate_401() {
+        let msg = translate_altool_error("", "Error: 401 Unauthorized");
+        assert!(msg.contains("authentication failed"), "{msg}");
+    }
+
+    #[test]
+    fn test_translate_unknown_error_includes_raw() {
+        let msg = translate_altool_error("some unknown stdout error", "some stderr detail");
+        assert!(msg.contains("App Store upload failed"), "{msg}");
+        assert!(msg.contains("some unknown stdout error"), "{msg}");
+        assert!(msg.contains("some stderr detail"), "{msg}");
+    }
+
+    #[test]
+    fn test_translate_itms_90161() {
+        let msg = translate_altool_error("ERROR ITMS-90161: missing icon", "");
+        assert!(msg.contains("app icon"), "{msg}");
+        assert!(msg.contains("1024"), "{msg}");
+    }
+
+    #[test]
+    fn test_translate_itms_90174() {
+        let msg = translate_altool_error("", "ERROR ITMS-90174: invalid signing");
+        assert!(msg.contains("signing"), "{msg}");
+        assert!(msg.contains("Apple Distribution"), "{msg}");
+    }
 }
 
 /// Upload a macOS .pkg to App Store Connect using xcrun altool.
@@ -149,11 +274,7 @@ pub async fn upload_macos_to_appstore(
         let _ = std::fs::remove_dir_all(&private_keys_dir);
         let stderr = String::from_utf8_lossy(&validate_output.stderr);
         let stdout = String::from_utf8_lossy(&validate_output.stdout);
-        return Err(format!(
-            "macOS app validation failed:\n{}\n{}",
-            stderr.trim(),
-            stdout.trim()
-        ));
+        return Err(translate_altool_error(&stdout, &stderr));
     }
 
     // Upload
@@ -189,11 +310,7 @@ pub async fn upload_macos_to_appstore(
         || upload_stderr.contains("Failed")
         || upload_stderr.contains("ERROR ITMS")
     {
-        return Err(format!(
-            "macOS App Store upload failed:\nstdout: {}\nstderr: {}",
-            upload_stdout.trim(),
-            upload_stderr.trim()
-        ));
+        return Err(translate_altool_error(&upload_stdout, &upload_stderr));
     }
 
     Ok(UploadResult {

@@ -7,6 +7,39 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Maps Google Play API HTTP errors to friendly, actionable messages.
+///
+/// Used for both OAuth token requests and Play API calls.
+pub fn map_playstore_error(operation: &str, status: u16, body: &str) -> String {
+    // Truncate at a char boundary to avoid panic on multibyte UTF-8 sequences
+    let body_preview = if body.chars().count() > 300 {
+        let truncated: String = body.chars().take(300).collect();
+        format!("{truncated}…")
+    } else {
+        body.to_string()
+    };
+
+    let guidance = match status {
+        400 | 401 => {
+            "Authentication failed — service account private key invalid or deactivated. \
+             Re-download key at https://console.cloud.google.com/iam-admin/serviceaccounts"
+        }
+        403 => {
+            "Permission denied — service account lacks Play Console access. \
+             Play Console → Setup → API access → Grant access → Release Manager"
+        }
+        404 => {
+            "App not found. Package not in Play Console, OR first version not yet manually uploaded. \
+             First release must go through Play Console UI."
+        }
+        429 => "Rate limited — wait a few minutes and retry.",
+        500..=599 => "Google Play server error — try again shortly.",
+        _ => return format!("Google Play {operation} failed (HTTP {status}): {body_preview}"),
+    };
+
+    format!("Google Play {operation} failed: {guidance}\n(HTTP {status}: {body_preview})")
+}
+
 #[derive(Debug)]
 pub struct UploadResult {
     pub message: String,
@@ -55,9 +88,9 @@ pub async fn upload_to_playstore(
         .map_err(|e| format!("Failed to create edit: {e}"))?;
 
     if !edit_resp.status().is_success() {
-        let status = edit_resp.status();
+        let status = edit_resp.status().as_u16();
         let body = edit_resp.text().await.unwrap_or_default();
-        return Err(format!("Failed to create edit ({status}): {body}"));
+        return Err(map_playstore_error("create edit", status, &body));
     }
 
     let edit: EditResponse = edit_resp
@@ -87,7 +120,7 @@ pub async fn upload_to_playstore(
         .map_err(|e| format!("Failed to upload AAB: {e}"))?;
 
     if !upload_resp.status().is_success() {
-        let status = upload_resp.status();
+        let status = upload_resp.status().as_u16();
         let body = upload_resp.text().await.unwrap_or_default();
         // Clean up: delete the edit on failure
         let _ = client
@@ -95,7 +128,7 @@ pub async fn upload_to_playstore(
             .header(AUTHORIZATION, format!("Bearer {access_token}"))
             .send()
             .await;
-        return Err(format!("Failed to upload AAB ({status}): {body}"));
+        return Err(map_playstore_error("upload AAB", status, &body));
     }
 
     let bundle: BundleResponse = upload_resp
@@ -126,16 +159,14 @@ pub async fn upload_to_playstore(
         .map_err(|e| format!("Failed to update track: {e}"))?;
 
     if !track_resp.status().is_success() {
-        let status = track_resp.status();
+        let status = track_resp.status().as_u16();
         let body = track_resp.text().await.unwrap_or_default();
         let _ = client
             .delete(format!("{api_base}/edits/{edit_id}"))
             .header(AUTHORIZATION, format!("Bearer {access_token}"))
             .send()
             .await;
-        return Err(format!(
-            "Failed to assign bundle to {track} track ({status}): {body}"
-        ));
+        return Err(map_playstore_error(&format!("assign to {track} track"), status, &body));
     }
 
     tracing::info!(track, version_code, "Assigned bundle to track");
@@ -149,9 +180,9 @@ pub async fn upload_to_playstore(
         .map_err(|e| format!("Failed to commit edit: {e}"))?;
 
     if !commit_resp.status().is_success() {
-        let status = commit_resp.status();
+        let status = commit_resp.status().as_u16();
         let body = commit_resp.text().await.unwrap_or_default();
-        return Err(format!("Failed to commit edit ({status}): {body}"));
+        return Err(map_playstore_error("commit edit", status, &body));
     }
 
     tracing::info!(edit_id, "Committed Google Play edit");
@@ -201,9 +232,9 @@ async fn get_access_token(client_email: &str, private_key: &str) -> Result<Strin
         .map_err(|e| format!("Failed to request OAuth2 token: {e}"))?;
 
     if !resp.status().is_success() {
-        let status = resp.status();
+        let status = resp.status().as_u16();
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("OAuth2 token request failed ({status}): {body}"));
+        return Err(map_playstore_error("OAuth2 token request", status, &body));
     }
 
     let token_resp: TokenResponse = resp
@@ -282,6 +313,78 @@ mod tests {
         let json = r#"{ "not_valid": true }"#;
         let result: Result<ServiceAccount, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_map_playstore_error_401() {
+        let msg = map_playstore_error("upload", 401, "Unauthorized");
+        assert!(msg.contains("Authentication failed"), "{msg}");
+        assert!(msg.contains("console.cloud.google.com"), "{msg}");
+        assert!(msg.contains("HTTP 401"), "{msg}");
+    }
+
+    #[test]
+    fn test_map_playstore_error_403() {
+        let msg = map_playstore_error("create edit", 403, "Forbidden");
+        assert!(msg.contains("Permission denied"), "{msg}");
+        assert!(msg.contains("Release Manager"), "{msg}");
+    }
+
+    #[test]
+    fn test_map_playstore_error_404() {
+        let msg = map_playstore_error("upload", 404, "Not Found");
+        assert!(msg.contains("App not found"), "{msg}");
+        assert!(msg.contains("manually uploaded"), "{msg}");
+    }
+
+    #[test]
+    fn test_map_playstore_error_429() {
+        let msg = map_playstore_error("upload", 429, "Too Many Requests");
+        assert!(msg.contains("Rate limited"), "{msg}");
+    }
+
+    #[test]
+    fn test_map_playstore_error_500() {
+        let msg = map_playstore_error("commit", 503, "Service Unavailable");
+        assert!(msg.contains("server error"), "{msg}");
+    }
+
+    #[test]
+    fn test_map_playstore_error_unknown_status() {
+        let msg = map_playstore_error("upload", 409, "Conflict");
+        assert!(msg.contains("HTTP 409"), "{msg}");
+        assert!(msg.contains("Conflict"), "{msg}");
+    }
+
+    #[test]
+    fn test_map_playstore_error_truncates_long_body() {
+        let long_body = "x".repeat(500);
+        let msg = map_playstore_error("upload", 403, &long_body);
+        // Should not include the full 500-char body
+        assert!(msg.len() < 600, "message too long: {} chars", msg.len());
+        assert!(msg.contains("…"), "should contain truncation marker");
+    }
+
+    #[test]
+    fn test_map_playstore_error_handles_multibyte_utf8() {
+        // Each emoji is 4 bytes — 400 bytes total but only 100 chars
+        // The slice at byte 300 would have panicked before the fix
+        let emoji_body: String = std::iter::repeat("🔥").take(100).collect(); // 400 bytes, 100 chars
+        let msg = map_playstore_error("upload", 403, &emoji_body);
+        assert!(msg.contains("Permission denied"), "{msg}");
+        // 100 chars < 300 limit, so no truncation
+        assert!(!msg.contains("…"), "no truncation needed for 100 chars: {msg}");
+    }
+
+    #[test]
+    fn test_map_playstore_error_truncates_multibyte_exactly() {
+        // 400 emojis = 400 chars > 300 limit, should truncate at char boundary
+        let emoji_body: String = std::iter::repeat("🎯").take(400).collect();
+        let msg = map_playstore_error("upload", 403, &emoji_body);
+        assert!(msg.contains("…"), "should truncate: {msg}");
+        // Must not contain more than 300 emojis in body preview
+        let emoji_count = msg.chars().filter(|&c| c == '🎯').count();
+        assert_eq!(emoji_count, 300, "should have exactly 300 emojis, got {emoji_count}");
     }
 
     #[test]
