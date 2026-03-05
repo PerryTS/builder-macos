@@ -1,4 +1,6 @@
-use crate::build::assets::{generate_android_icons, generate_icns, generate_ios_icons};
+use crate::build::assets::{
+    compile_ios_icon_asset_catalog, generate_android_icons, generate_icns, generate_ios_icons,
+};
 use crate::build::cleanup::{cleanup_tmpdir, create_build_tmpdir};
 use crate::build::compiler;
 use crate::config::WorkerConfig;
@@ -137,6 +139,9 @@ async fn run_macos_pipeline(
     binary_path: &std::path::Path,
     project_dir: &std::path::Path,
 ) -> Result<PathBuf, String> {
+    let distribute = request.manifest.macos_distribute.as_deref().unwrap_or("notarize");
+    let is_appstore = distribute == "appstore";
+
     // Stage 3: Generate assets (icons)
     send_stage(progress, StageName::GeneratingAssets, "Generating app icons");
     check_cancelled(cancelled)?;
@@ -153,19 +158,28 @@ async fn run_macos_pipeline(
     send_stage(progress, StageName::Bundling, "Creating macOS .app bundle");
     check_cancelled(cancelled)?;
     let app_path = tmpdir.join(format!("{}.app", request.manifest.app_name));
-    let icns_opt = if icns_path.exists() {
-        Some(icns_path.as_path())
-    } else {
-        None
-    };
+    let icns_opt = if icns_path.exists() { Some(icns_path.as_path()) } else { None };
     macos::create_app_bundle(&request.manifest, binary_path, icns_opt, &app_path)?;
     send_progress(progress, StageName::Bundling, 100, None);
 
     // Stage 5: Code sign
     send_stage(progress, StageName::Signing, "Signing application");
     check_cancelled(cancelled)?;
-    let has_signing = request.credentials.apple_signing_identity.is_some();
-    if has_signing {
+
+    // Resolve signing identity: p12 (temp keychain) takes priority over pre-installed cert
+    let temp_kc = if let (Some(p12_b64), Some(p12_pass)) = (
+        request.credentials.apple_certificate_p12_base64.as_deref(),
+        request.credentials.apple_certificate_password.as_deref(),
+    ) {
+        Some(apple::TempKeychain::create(&request.job_id, p12_b64, p12_pass, tmpdir).await?)
+    } else {
+        None
+    };
+    let effective_identity = temp_kc.as_ref()
+        .map(|kc| kc.identity.as_str())
+        .or_else(|| request.credentials.apple_signing_identity.as_deref());
+
+    if let Some(identity) = effective_identity {
         let entitlements_path = if request.manifest.entitlements.is_some() {
             let p = tmpdir.join("entitlements.plist");
             macos::write_entitlements_plist(&request.manifest, &p)?;
@@ -173,43 +187,98 @@ async fn run_macos_pipeline(
         } else {
             None
         };
+        let kc_path = temp_kc.as_ref().map(|kc| kc.path.as_str());
         apple::codesign_app(
-            request.credentials.apple_signing_identity.as_deref().unwrap(),
+            identity,
             entitlements_path.as_deref(),
             &app_path,
+            !is_appstore, // hardened runtime for notarization, not needed for App Store
+            kc_path,
         )
         .await?;
     }
     send_progress(progress, StageName::Signing, 100, None);
 
-    // Stage 6: Package DMG
-    send_stage(progress, StageName::Packaging, "Creating DMG");
-    check_cancelled(cancelled)?;
-    let dmg_path = tmpdir.join(format!("{}.dmg", request.manifest.app_name));
-    macos::create_dmg(&request.manifest.app_name, &app_path, &dmg_path).await?;
-    send_progress(progress, StageName::Packaging, 100, None);
+    if is_appstore {
+        // App Store path: create .pkg and upload to App Store Connect
 
-    // Stage 7: Notarize
-    send_stage(progress, StageName::Notarizing, "Notarizing with Apple");
-    check_cancelled(cancelled)?;
-    let has_notarization = request.credentials.apple_key_id.is_some()
-        && request.credentials.apple_issuer_id.is_some()
-        && request.credentials.apple_p8_key.is_some();
-    if has_notarization {
-        apple::notarize_dmg(
-            &dmg_path,
-            request.credentials.apple_p8_key.as_deref().unwrap(),
-            request.credentials.apple_key_id.as_deref().unwrap(),
-            request.credentials.apple_issuer_id.as_deref().unwrap(),
-            tmpdir,
-        )
-        .await?;
+        // Stage 6: Package .pkg
+        send_stage(progress, StageName::Packaging, "Creating installer package (.pkg)");
+        check_cancelled(cancelled)?;
+        let pkg_path = tmpdir.join(format!("{}.pkg", request.manifest.app_name));
+        // Derive installer identity from effective identity
+        let installer_identity = effective_identity
+            .map(|id| id.replace("Mac Developer Application:", "Mac Developer Installer:"))
+            .unwrap_or_default();
+        // productsign searches the keychain list — add temp keychain if present
+        if let Some(ref kc) = temp_kc {
+            let _ = kc.add_to_search_list();
+        }
+        macos::create_pkg(&app_path, &pkg_path, &installer_identity).await?;
+        if let Some(ref kc) = temp_kc {
+            kc.remove_from_search_list();
+        }
+        send_progress(progress, StageName::Packaging, 100, None);
+
+        // Stage 7: Upload to App Store Connect
+        let has_creds = request.credentials.apple_key_id.is_some()
+            && request.credentials.apple_issuer_id.is_some()
+            && request.credentials.apple_p8_key.is_some();
+        if has_creds {
+            send_stage(progress, StageName::Publishing, "Uploading to App Store Connect");
+            check_cancelled(cancelled)?;
+            let result = appstore::upload_macos_to_appstore(
+                &pkg_path,
+                request.credentials.apple_p8_key.as_deref().unwrap(),
+                request.credentials.apple_key_id.as_deref().unwrap(),
+                request.credentials.apple_issuer_id.as_deref().unwrap(),
+                tmpdir,
+            )
+            .await?;
+            let _ = progress.send(ServerMessage::Published {
+                platform: "macos".into(),
+                message: result.message,
+                url: None,
+            });
+            send_progress(progress, StageName::Publishing, 100, None);
+        } else {
+            send_stage(progress, StageName::Publishing, "Skipping App Store upload (no API credentials)");
+            send_progress(progress, StageName::Publishing, 100, None);
+        }
+
+        let artifact_path = copy_artifact(&pkg_path, &request.manifest.app_name, &request.job_id, "pkg")?;
+        Ok(artifact_path)
+    } else {
+        // Notarize path: create .dmg, notarize, return DMG
+
+        // Stage 6: Package DMG
+        send_stage(progress, StageName::Packaging, "Creating DMG");
+        check_cancelled(cancelled)?;
+        let dmg_path = tmpdir.join(format!("{}.dmg", request.manifest.app_name));
+        macos::create_dmg(&request.manifest.app_name, &app_path, &dmg_path).await?;
+        send_progress(progress, StageName::Packaging, 100, None);
+
+        // Stage 7: Notarize
+        send_stage(progress, StageName::Notarizing, "Notarizing with Apple");
+        check_cancelled(cancelled)?;
+        let has_notarization = request.credentials.apple_key_id.is_some()
+            && request.credentials.apple_issuer_id.is_some()
+            && request.credentials.apple_p8_key.is_some();
+        if has_notarization {
+            apple::notarize_dmg(
+                &dmg_path,
+                request.credentials.apple_p8_key.as_deref().unwrap(),
+                request.credentials.apple_key_id.as_deref().unwrap(),
+                request.credentials.apple_issuer_id.as_deref().unwrap(),
+                tmpdir,
+            )
+            .await?;
+        }
+        send_progress(progress, StageName::Notarizing, 100, None);
+
+        let artifact_path = copy_artifact(&dmg_path, &request.manifest.app_name, &request.job_id, "dmg")?;
+        Ok(artifact_path)
     }
-    send_progress(progress, StageName::Notarizing, 100, None);
-
-    // Copy artifact to stable location
-    let artifact_path = copy_artifact(&dmg_path, &request.manifest.app_name, &request.job_id, "dmg")?;
-    Ok(artifact_path)
 }
 
 async fn run_ios_pipeline(
@@ -221,6 +290,10 @@ async fn run_ios_pipeline(
     binary_path: &std::path::Path,
     project_dir: &std::path::Path,
 ) -> Result<PathBuf, String> {
+    // Query Xcode/SDK info for Info.plist DT* keys
+    let sdk_info = query_sdk_info().await;
+    let team_id = request.credentials.apple_team_id.as_deref().unwrap_or("");
+
     // Stage 3: Generate iOS assets (icons)
     send_stage(progress, StageName::GeneratingAssets, "Generating iOS app icons");
     check_cancelled(cancelled)?;
@@ -260,13 +333,35 @@ async fn run_ios_pipeline(
         icon_png.as_deref(),
         profile_path.as_deref(),
         &app_path,
+        Some(&sdk_info),
     )?;
 
     if icons_dir.exists() {
+        // Copy individual PNGs into bundle (required by altool validation for all iOS versions)
         for entry in std::fs::read_dir(&icons_dir).map_err(|e| format!("Read icons dir: {e}"))? {
             let entry = entry.map_err(|e| format!("Icon entry: {e}"))?;
             std::fs::copy(entry.path(), app_path.join(entry.file_name()))
                 .map_err(|e| format!("Copy icon: {e}"))?;
+        }
+        // Compile icon asset catalog → Assets.car (required for iOS 11+ App Store)
+        let deployment_target = request
+            .manifest
+            .ios_deployment_target
+            .as_deref()
+            .unwrap_or("16.0");
+        match compile_ios_icon_asset_catalog(&icons_dir, deployment_target, tmpdir).await {
+            Ok(assets_car) => {
+                std::fs::copy(&assets_car, app_path.join("Assets.car"))
+                    .map_err(|e| format!("Failed to copy Assets.car into bundle: {e}"))?;
+            }
+            Err(e) => {
+                // Log but don't fail — individual PNGs are still in the bundle
+                let _ = progress.send(crate::ws::messages::ServerMessage::Log {
+                    stage: crate::ws::messages::StageName::Bundling,
+                    line: format!("Warning: asset catalog compilation failed: {e}"),
+                    stream: crate::ws::messages::LogStream::Stderr,
+                });
+            }
         }
     }
     send_progress(progress, StageName::Bundling, 100, None);
@@ -274,17 +369,31 @@ async fn run_ios_pipeline(
     // Stage 5: Code sign iOS app
     send_stage(progress, StageName::Signing, "Signing iOS application");
     check_cancelled(cancelled)?;
-    let has_signing = request.credentials.apple_signing_identity.is_some();
-    if has_signing {
+    let temp_kc = if let (Some(p12_b64), Some(p12_pass)) = (
+        request.credentials.apple_certificate_p12_base64.as_deref(),
+        request.credentials.apple_certificate_password.as_deref(),
+    ) {
+        Some(apple::TempKeychain::create(&request.job_id, p12_b64, p12_pass, tmpdir).await?)
+    } else {
+        None
+    };
+    let effective_identity = temp_kc.as_ref()
+        .map(|kc| kc.identity.as_str())
+        .or_else(|| request.credentials.apple_signing_identity.as_deref());
+
+    if let Some(identity) = effective_identity {
         let entitlements_path = {
             let p = tmpdir.join("entitlements.plist");
-            ios::write_ios_entitlements_plist(&request.manifest, &p)?;
+            ios::write_ios_entitlements_plist(&request.manifest, team_id, &p)?;
             p
         };
+        let kc_path = temp_kc.as_ref().map(|kc| kc.path.as_str());
         apple::codesign_app(
-            request.credentials.apple_signing_identity.as_deref().unwrap(),
+            identity,
             Some(&entitlements_path),
             &app_path,
+            false, // iOS: no hardened runtime flag
+            kc_path,
         )
         .await?;
     }
@@ -570,6 +679,59 @@ fn extract_tarball(tarball_path: &std::path::Path, dest: &std::path::Path) -> Re
         .unpack(dest)
         .map_err(|e| format!("Failed to extract tarball: {e}"))?;
     Ok(())
+}
+
+/// Query the local Xcode installation for SDK/version info to embed in Info.plist.
+/// Falls back to reasonable defaults if commands fail.
+async fn query_sdk_info() -> ios::SdkInfo {
+    let sdk_version = tokio::process::Command::new("xcrun")
+        .args(["--sdk", "iphoneos", "--show-sdk-version"])
+        .output()
+        .await
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "18.0".to_string());
+
+    let sdk_build = tokio::process::Command::new("xcrun")
+        .args(["--sdk", "iphoneos", "--show-sdk-build-version"])
+        .output()
+        .await
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "22C5048d".to_string());
+
+    let xcode_out = tokio::process::Command::new("xcodebuild")
+        .arg("-version")
+        .output()
+        .await
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+
+    let mut dt_xcode = "1620".to_string();
+    let mut dt_xcode_build = "16C5032a".to_string();
+    for line in xcode_out.lines() {
+        if let Some(ver) = line.strip_prefix("Xcode ") {
+            let parts: Vec<&str> = ver.trim().split('.').collect();
+            let major: u32 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(16);
+            let minor: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            dt_xcode = format!("{}{:02}0", major, minor);
+        } else if let Some(build) = line.strip_prefix("Build version ") {
+            dt_xcode_build = build.trim().to_string();
+        }
+    }
+
+    ios::SdkInfo {
+        platform_version: sdk_version.clone(),
+        sdk_name: format!("iphoneos{sdk_version}"),
+        sdk_build,
+        xcode: dt_xcode,
+        xcode_build: dt_xcode_build,
+    }
 }
 
 fn base64_decode(input: &str) -> Result<Vec<u8>, String> {

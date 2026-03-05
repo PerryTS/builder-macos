@@ -6,10 +6,13 @@ use std::path::Path;
 /// iOS icon sizes (filename, size in pixels)
 /// These are the required sizes for App Store submission
 const IOS_ICON_SIZES: &[(&str, u32)] = &[
+    ("Icon-20.png", 20),       // iPad @1x
     ("Icon-20@2x.png", 40),
     ("Icon-20@3x.png", 60),
+    ("Icon-29.png", 29),       // iPad @1x
     ("Icon-29@2x.png", 58),
     ("Icon-29@3x.png", 87),
+    ("Icon-40.png", 40),       // iPad @1x
     ("Icon-40@2x.png", 80),
     ("Icon-40@3x.png", 120),
     ("Icon-60@2x.png", 120),
@@ -159,6 +162,113 @@ fn write_icns(output_path: &Path, entries: &[(Vec<u8>, &[u8; 4])]) -> Result<(),
     }
 
     Ok(())
+}
+
+/// Compile an iOS icon asset catalog (AppIcon.appiconset) from a directory of icon PNGs.
+/// Returns the path to the compiled `Assets.car` file.
+pub async fn compile_ios_icon_asset_catalog(
+    icons_dir: &Path,
+    deployment_target: &str,
+    work_dir: &Path,
+) -> Result<std::path::PathBuf, String> {
+    let xcassets = work_dir.join("AppIcons.xcassets");
+    let appiconset = xcassets.join("AppIcon.appiconset");
+    std::fs::create_dir_all(&appiconset)
+        .map_err(|e| format!("Failed to create appiconset dir: {e}"))?;
+
+    // Copy icon PNGs into the appiconset
+    let mut images_json = Vec::new();
+    for (filename, size) in IOS_ICON_SIZES {
+        let src = icons_dir.join(filename);
+        if src.exists() {
+            std::fs::copy(&src, appiconset.join(filename))
+                .map_err(|e| format!("Failed to copy icon {filename}: {e}"))?;
+            // Build Contents.json entry
+            let (idiom, scale, pt_size) = icon_entry_metadata(filename, *size);
+            images_json.push(format!(
+                r#"    {{"filename": "{filename}", "idiom": "{idiom}", "scale": "{scale}", "size": "{pt_size}"}}"#
+            ));
+        }
+    }
+    // Always include the 1024 marketing icon
+    let marketing = icons_dir.join("Icon-1024.png");
+    if marketing.exists() {
+        images_json.push(
+            r#"    {"filename": "Icon-1024.png", "idiom": "ios-marketing", "scale": "1x", "size": "1024x1024"}"#
+                .to_string(),
+        );
+    }
+
+    let contents = format!(
+        "{{\n  \"images\": [\n{}\n  ],\n  \"info\": {{\"author\": \"xcode\", \"version\": 1}}\n}}",
+        images_json.join(",\n")
+    );
+    std::fs::write(appiconset.join("Contents.json"), &contents)
+        .map_err(|e| format!("Failed to write Contents.json: {e}"))?;
+
+    // Compile with actool
+    let compiled_dir = work_dir.join("compiled_assets");
+    std::fs::create_dir_all(&compiled_dir)
+        .map_err(|e| format!("Failed to create compiled_assets dir: {e}"))?;
+
+    let output = tokio::process::Command::new("xcrun")
+        .arg("actool")
+        .arg(&xcassets)
+        .arg("--compile")
+        .arg(&compiled_dir)
+        .arg("--platform")
+        .arg("iphoneos")
+        .arg("--minimum-deployment-target")
+        .arg(deployment_target)
+        .arg("--app-icon")
+        .arg("AppIcon")
+        .arg("--output-partial-info-plist")
+        .arg("/dev/null")
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run actool: {e}"))?;
+
+    let assets_car = compiled_dir.join("Assets.car");
+    if !assets_car.exists() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "actool did not produce Assets.car:\nstdout: {stdout}\nstderr: {stderr}"
+        ));
+    }
+
+    Ok(assets_car)
+}
+
+fn icon_entry_metadata(filename: &str, size: u32) -> (&'static str, &'static str, String) {
+    let scale = if filename.contains("@3x") {
+        "3x"
+    } else if filename.contains("@2x") {
+        "2x"
+    } else {
+        "1x"
+    };
+    let divisor: u32 = match scale {
+        "3x" => 3,
+        "2x" => 2,
+        _ => 1,
+    };
+    let pt = size / divisor;
+    // For 83.5pt the file is "Icon-83.5@2x.png", size=167, pt=83.5
+    let pt_str = if filename.contains("83.5") {
+        "83.5x83.5".to_string()
+    } else {
+        format!("{pt}x{pt}")
+    };
+    // Determine idiom: files ending in @3x are iPhone-only
+    let idiom = if filename.contains("@3x") || filename.contains("Icon-60") {
+        "iphone"
+    } else if filename.contains("Icon-83.5") || filename.contains("Icon-76") {
+        "ipad"
+    } else {
+        "universal"
+    };
+    (idiom, scale, pt_str)
 }
 
 #[cfg(test)]

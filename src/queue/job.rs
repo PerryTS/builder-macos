@@ -27,6 +27,9 @@ pub struct BuildManifest {
     pub ios_capabilities: Option<Vec<String>>,
     #[serde(default)]
     pub ios_distribute: Option<String>,
+    // macOS-specific fields
+    #[serde(default)]
+    pub macos_distribute: Option<String>,
     // Android-specific fields
     #[serde(default)]
     pub android_min_sdk: Option<String>,
@@ -48,6 +51,14 @@ pub struct BuildCredentials {
     /// Base64-encoded provisioning profile for iOS
     #[serde(default)]
     pub provisioning_profile_base64: Option<String>,
+    /// Base64-encoded .p12 certificate bundle for Apple code signing.
+    /// When present the worker creates a temporary keychain per build,
+    /// imports this cert, then deletes the keychain on completion.
+    #[serde(default)]
+    pub apple_certificate_p12_base64: Option<String>,
+    /// Password for the .p12 certificate bundle. Never persisted.
+    #[serde(default)]
+    pub apple_certificate_password: Option<String>,
     /// Base64-encoded .jks keystore for Android signing
     #[serde(default)]
     pub android_keystore_base64: Option<String>,

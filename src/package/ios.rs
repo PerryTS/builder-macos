@@ -2,6 +2,15 @@ use crate::queue::job::BuildManifest;
 use std::path::Path;
 use tokio::process::Command;
 
+/// Xcode/SDK version info injected into Info.plist.
+pub struct SdkInfo {
+    pub platform_version: String,
+    pub sdk_name: String,
+    pub sdk_build: String,
+    pub xcode: String,
+    pub xcode_build: String,
+}
+
 /// Device family constants for UIDeviceFamily
 const DEVICE_IPHONE: u8 = 1;
 const DEVICE_IPAD: u8 = 2;
@@ -12,6 +21,7 @@ pub fn create_ios_app_bundle(
     icon_png_path: Option<&Path>,
     provisioning_profile: Option<&Path>,
     app_path: &Path,
+    sdk_info: Option<&SdkInfo>,
 ) -> Result<(), String> {
     std::fs::create_dir_all(app_path)
         .map_err(|e| format!("Failed to create iOS .app dir: {e}"))?;
@@ -45,20 +55,30 @@ pub fn create_ios_app_bundle(
     }
 
     // Generate Info.plist
-    let info_plist = generate_ios_info_plist(manifest);
-    std::fs::write(app_path.join("Info.plist"), info_plist)
+    let info_plist = generate_ios_info_plist(manifest, sdk_info);
+    let plist_path = app_path.join("Info.plist");
+    std::fs::write(&plist_path, &info_plist)
         .map_err(|e| format!("Failed to write iOS Info.plist: {e}"))?;
+
+    // Convert to binary plist format (required by altool validation)
+    let _ = std::process::Command::new("plutil")
+        .arg("-convert")
+        .arg("binary1")
+        .arg(&plist_path)
+        .status();
 
     Ok(())
 }
 
 pub fn write_ios_entitlements_plist(
     manifest: &BuildManifest,
+    team_id: &str,
     path: &Path,
 ) -> Result<(), String> {
     let capabilities = manifest.ios_capabilities.as_deref().unwrap_or(&[]);
     let plist = generate_ios_entitlements(
         &manifest.bundle_id,
+        team_id,
         capabilities,
     );
     std::fs::write(path, plist).map_err(|e| format!("Failed to write entitlements: {e}"))?;
@@ -105,7 +125,7 @@ pub async fn create_ipa(
     Ok(())
 }
 
-fn generate_ios_info_plist(manifest: &BuildManifest) -> String {
+fn generate_ios_info_plist(manifest: &BuildManifest, sdk_info: Option<&SdkInfo>) -> String {
     let short_version = manifest
         .short_version
         .as_deref()
@@ -124,6 +144,7 @@ fn generate_ios_info_plist(manifest: &BuildManifest) -> String {
         .map(|d| format!("\t\t<integer>{d}</integer>"))
         .collect::<Vec<_>>()
         .join("\n");
+    let supports_ipad = device_families.contains(&DEVICE_IPAD);
 
     // Orientations
     let orientations = resolve_orientations(
@@ -134,6 +155,53 @@ fn generate_ios_info_plist(manifest: &BuildManifest) -> String {
         .map(|o| format!("\t\t<string>{o}</string>"))
         .collect::<Vec<_>>()
         .join("\n");
+
+    // iPad multitasking requires all 4 orientations in the ~ipad key
+    let ipad_orientation_xml = if supports_ipad {
+        let all_four = [
+            "UIInterfaceOrientationPortrait",
+            "UIInterfaceOrientationPortraitUpsideDown",
+            "UIInterfaceOrientationLandscapeLeft",
+            "UIInterfaceOrientationLandscapeRight",
+        ];
+        let xml = all_four
+            .iter()
+            .map(|o| format!("\t\t<string>{o}</string>"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "\t<key>UISupportedInterfaceOrientations~ipad</key>\n\t<array>\n{xml}\n\t</array>"
+        )
+    } else {
+        String::new()
+    };
+
+    // Xcode/SDK version keys — required by App Store Connect validation
+    let dt_keys = if let Some(info) = sdk_info {
+        format!(
+            r#"	<key>DTPlatformName</key>
+	<string>iphoneos</string>
+	<key>DTPlatformVersion</key>
+	<string>{platform_version}</string>
+	<key>DTSDKName</key>
+	<string>{sdk_name}</string>
+	<key>DTSDKBuild</key>
+	<string>{sdk_build}</string>
+	<key>DTXcode</key>
+	<string>{xcode}</string>
+	<key>DTXcodeBuild</key>
+	<string>{xcode_build}</string>
+	<key>DTCompiler</key>
+	<string>com.apple.compilers.llvm.clang.1_0</string>"#,
+            platform_version = info.platform_version,
+            sdk_name = info.sdk_name,
+            sdk_build = info.sdk_build,
+            xcode = info.xcode,
+            xcode_build = info.xcode_build,
+        )
+    } else {
+        "\t<key>DTPlatformName</key>\n\t<string>iphoneos</string>".to_string()
+    };
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -160,10 +228,53 @@ fn generate_ios_info_plist(manifest: &BuildManifest) -> String {
 	<array>
 {orientation_xml}
 	</array>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
+	<key>CFBundleIcons</key>
+	<dict>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleIconFiles</key>
+			<array>
+				<string>Icon-20</string>
+				<string>Icon-29</string>
+				<string>Icon-40</string>
+				<string>Icon-60</string>
+			</array>
+			<key>CFBundleIconName</key>
+			<string>AppIcon</string>
+		</dict>
+	</dict>
+	<key>CFBundleIcons~ipad</key>
+	<dict>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleIconFiles</key>
+			<array>
+				<string>Icon-20</string>
+				<string>Icon-29</string>
+				<string>Icon-40</string>
+				<string>Icon-76</string>
+				<string>Icon-83.5</string>
+			</array>
+			<key>CFBundleIconName</key>
+			<string>AppIcon</string>
+		</dict>
+	</dict>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>iPhoneOS</string>
+	</array>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
+{dt_keys}
+{ipad_orientation_xml}
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
@@ -189,6 +300,12 @@ fn generate_ios_info_plist(manifest: &BuildManifest) -> String {
         bundle_id = manifest.bundle_id,
         name = manifest.app_name,
         version = manifest.version,
+        short_version = short_version,
+        deployment_target = deployment_target,
+        device_family_xml = device_family_xml,
+        orientation_xml = orientation_xml,
+        dt_keys = dt_keys,
+        ipad_orientation_xml = ipad_orientation_xml,
     )
 }
 
@@ -228,10 +345,15 @@ fn resolve_orientations(orientations: &[String]) -> Vec<&'static str> {
         .collect()
 }
 
-fn generate_ios_entitlements(bundle_id: &str, capabilities: &[String]) -> String {
+fn generate_ios_entitlements(bundle_id: &str, team_id: &str, capabilities: &[String]) -> String {
+    let app_id = if team_id.is_empty() {
+        bundle_id.to_string()
+    } else {
+        format!("{team_id}.{bundle_id}")
+    };
     let mut entries = vec![
-        // App ID is always included
-        format!("\t<key>application-identifier</key>\n\t<string>$(AppIdentifierPrefix){bundle_id}</string>"),
+        // App ID is always included — must be team_id.bundle_id (NOT $(AppIdentifierPrefix)...)
+        format!("\t<key>application-identifier</key>\n\t<string>{app_id}</string>"),
     ];
 
     for cap in capabilities {
@@ -316,9 +438,10 @@ mod tests {
             android_target_sdk: None,
             android_permissions: None,
             android_distribute: None,
+            macos_distribute: None,
         };
 
-        let plist = generate_ios_info_plist(&manifest);
+        let plist = generate_ios_info_plist(&manifest, None);
         assert!(plist.contains("<string>MyApp</string>"));
         assert!(plist.contains("<string>com.example.myapp</string>"));
         assert!(plist.contains("<string>16.0</string>"));
@@ -352,9 +475,10 @@ mod tests {
             android_target_sdk: None,
             android_permissions: None,
             android_distribute: None,
+            macos_distribute: None,
         };
 
-        let plist = generate_ios_info_plist(&manifest);
+        let plist = generate_ios_info_plist(&manifest, None);
         // Default deployment target
         assert!(plist.contains("<string>16.0</string>"));
         // Default device families (both iPhone + iPad)
@@ -398,6 +522,7 @@ mod tests {
     fn test_ios_entitlements() {
         let entitlements = generate_ios_entitlements(
             "com.example.app",
+            "TEAM123",
             &["push-notifications".into()],
         );
         assert!(entitlements.contains("application-identifier"));

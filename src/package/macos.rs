@@ -55,6 +55,35 @@ pub fn write_entitlements_plist(manifest: &BuildManifest, path: &Path) -> Result
     Ok(())
 }
 
+/// Create a signed .pkg installer for Mac App Store submission.
+///
+/// Signs the .pkg with the installer identity derived from the app signing identity
+/// (by replacing "Application" → "Installer" in the identity name).
+pub async fn create_pkg(
+    app_path: &Path,
+    pkg_path: &Path,
+    installer_identity: &str,
+) -> Result<(), String> {
+    let output = Command::new("productbuild")
+        .arg("--component")
+        .arg(app_path)
+        .arg("/Applications")
+        .arg("--sign")
+        .arg(installer_identity)
+        .arg(pkg_path)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run productbuild: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!("productbuild failed: {stderr}\n{stdout}"));
+    }
+
+    Ok(())
+}
+
 pub async fn create_dmg(app_name: &str, app_path: &Path, dmg_path: &Path) -> Result<(), String> {
     let staging_dir = dmg_path
         .parent()
@@ -219,6 +248,7 @@ mod tests {
             android_target_sdk: None,
             android_permissions: None,
             android_distribute: None,
+            macos_distribute: None,
         };
 
         let plist = generate_info_plist(&manifest, Some("AppIcon.icns"));
@@ -253,6 +283,7 @@ mod tests {
             android_target_sdk: None,
             android_permissions: None,
             android_distribute: None,
+            macos_distribute: None,
         };
 
         let plist = generate_info_plist(&manifest, None);

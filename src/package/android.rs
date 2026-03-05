@@ -54,12 +54,12 @@ pub fn create_android_project(
         let content = std::fs::read_to_string(&build_gradle)
             .map_err(|e| format!("Failed to read build.gradle.kts: {e}"))?;
         let min_sdk = manifest.android_min_sdk.as_deref().unwrap_or("24");
-        let target_sdk = manifest.android_target_sdk.as_deref().unwrap_or("34");
+        let target_sdk = manifest.android_target_sdk.as_deref().unwrap_or("35");
         let version_code = version_to_code(&manifest.version);
         let content = content
             .replace("com.perry.template", &manifest.bundle_id)
             .replace("minSdk = 24", &format!("minSdk = {min_sdk}"))
-            .replace("targetSdk = 34", &format!("targetSdk = {target_sdk}"))
+            .replace("targetSdk = 35", &format!("targetSdk = {target_sdk}"))
             .replace("versionCode = 1", &format!("versionCode = {version_code}"))
             .replace("versionName = \"1.0\"", &format!("versionName = \"{}\"", manifest.version));
         std::fs::write(&build_gradle, content)
@@ -197,8 +197,7 @@ pub fn generate_android_manifest_xml(manifest: &BuildManifest) -> String {
 
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="{bundle_id}">{permissions_block}
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">{permissions_block}
     <application
         android:allowBackup="true"
         android:label="{app_name}"
@@ -216,8 +215,8 @@ pub fn generate_android_manifest_xml(manifest: &BuildManifest) -> String {
         </activity>
     </application>
 </manifest>"#,
-        bundle_id = manifest.bundle_id,
         app_name = manifest.app_name,
+        permissions_block = permissions_block,
     )
 }
 
@@ -260,29 +259,35 @@ async fn run_gradle(
     let tx_out = tx.cloned();
     let stdout_task = tokio::spawn(async move {
         let mut reader = BufReader::new(stdout).lines();
+        let mut lines = Vec::new();
         while let Ok(Some(line)) = reader.next_line().await {
             if let Some(ref tx) = tx_out {
                 let _ = tx.send(ServerMessage::Log {
                     stage: StageName::Bundling,
-                    line,
+                    line: line.clone(),
                     stream: LogStream::Stdout,
                 });
             }
+            lines.push(line);
         }
+        lines
     });
 
     let tx_err = tx.cloned();
     let stderr_task = tokio::spawn(async move {
         let mut reader = BufReader::new(stderr).lines();
+        let mut lines = Vec::new();
         while let Ok(Some(line)) = reader.next_line().await {
             if let Some(ref tx) = tx_err {
                 let _ = tx.send(ServerMessage::Log {
                     stage: StageName::Bundling,
-                    line,
+                    line: line.clone(),
                     stream: LogStream::Stderr,
                 });
             }
+            lines.push(line);
         }
+        lines
     });
 
     let status = child
@@ -290,14 +295,26 @@ async fn run_gradle(
         .await
         .map_err(|e| format!("Failed to wait for gradle: {e}"))?;
 
-    stdout_task.await.ok();
-    stderr_task.await.ok();
+    let stdout_lines = stdout_task.await.unwrap_or_default();
+    let stderr_lines = stderr_task.await.unwrap_or_default();
 
     if !status.success() {
+        // Include last 30 lines of output in error for visibility
+        let all_lines: Vec<&str> = stdout_lines
+            .iter()
+            .chain(stderr_lines.iter())
+            .map(|s| s.as_str())
+            .collect();
+        let tail = if all_lines.len() > 30 {
+            &all_lines[all_lines.len() - 30..]
+        } else {
+            &all_lines
+        };
         return Err(format!(
-            "Gradle {} failed with exit code {}",
+            "Gradle {} failed with exit code {}:\n{}",
             task,
-            status.code().unwrap_or(-1)
+            status.code().unwrap_or(-1),
+            tail.join("\n")
         ));
     }
 
@@ -436,10 +453,11 @@ mod tests {
             android_target_sdk: None,
             android_permissions: None,
             android_distribute: None,
+            macos_distribute: None,
         };
 
         let xml = generate_android_manifest_xml(&manifest);
-        assert!(xml.contains("package=\"com.example.testapp\""));
+        assert!(!xml.contains("package=\""));
         assert!(xml.contains("android:label=\"TestApp\""));
         assert!(xml.contains("PerryActivity"));
         assert!(xml.contains("android.intent.action.MAIN"));
@@ -472,12 +490,13 @@ mod tests {
                 "ACCESS_FINE_LOCATION".into(),
             ]),
             android_distribute: None,
+            macos_distribute: None,
         };
 
         let xml = generate_android_manifest_xml(&manifest);
         assert!(xml.contains("android.permission.INTERNET"));
         assert!(xml.contains("android.permission.ACCESS_FINE_LOCATION"));
-        assert!(xml.contains("package=\"com.example.myapp\""));
+        assert!(!xml.contains("package=\""));
         assert!(xml.contains("android:label=\"MyApp\""));
     }
 
@@ -505,6 +524,7 @@ mod tests {
                 "com.google.android.providers.gsf.permission.READ_GSERVICES".into(),
             ]),
             android_distribute: None,
+            macos_distribute: None,
         };
 
         let xml = generate_android_manifest_xml(&manifest);
