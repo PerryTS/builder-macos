@@ -32,7 +32,7 @@ impl TempKeychain {
         std::fs::write(&p12_path, &p12_bytes)
             .map_err(|e| format!("Failed to write .p12: {e}"))?;
 
-        let kc_name = format!("perry-kc-{job_id}");
+        let kc_name = format!("perry-kc-{job_id}.keychain");
         let kc_password = format!("{job_id}-kc");
 
         // Helper: delete keychain on any error below
@@ -108,7 +108,7 @@ impl TempKeychain {
 
         // Resolve full keychain path (security appends .keychain-db)
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let kc_path = format!("{home}/Library/Keychains/{kc_name}.keychain-db");
+        let kc_path = format!("{home}/Library/Keychains/{kc_name}-db");
 
         Ok(TempKeychain { path: kc_path, identity, kc_password })
     }

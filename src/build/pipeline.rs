@@ -187,6 +187,10 @@ async fn run_macos_pipeline(
         } else {
             None
         };
+        // Add temp keychain to search list so codesign can find the private key
+        if let Some(ref kc) = temp_kc {
+            kc.add_to_search_list().map_err(|e| format!("Failed to add keychain to search list: {e}"))?;
+        }
         let kc_path = temp_kc.as_ref().map(|kc| kc.path.as_str());
         apple::codesign_app(
             identity,
@@ -389,6 +393,10 @@ async fn run_ios_pipeline(
             ios::write_ios_entitlements_plist(&request.manifest, team_id, &p)?;
             p
         };
+        // Add temp keychain to search list so codesign can find the private key
+        if let Some(ref kc) = temp_kc {
+            kc.add_to_search_list().map_err(|e| format!("Failed to add keychain to search list: {e}"))?;
+        }
         let kc_path = temp_kc.as_ref().map(|kc| kc.path.as_str());
         apple::codesign_app(
             identity,
