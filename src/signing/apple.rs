@@ -94,6 +94,28 @@ impl TempKeychain {
             return Err(format!("set-key-partition-list failed: {stderr}"));
         }
 
+        // 4b. Import Apple WWDR intermediate CA into temp keychain
+        // so find-identity can validate the full certificate chain.
+        // Without this, openssl-generated .p12 files (lacking CA chain) won't be recognized.
+        for wwdr_path in &[
+            "/Library/Keychains/System.keychain",
+        ] {
+            // Export WWDR certs from system keychain and import into our temp keychain
+            let export_out = std::process::Command::new("security")
+                .args(["find-certificate", "-c", "Apple Worldwide Developer Relations", "-p", wwdr_path])
+                .output();
+            if let Ok(ref out) = export_out {
+                if out.status.success() && !out.stdout.is_empty() {
+                    let wwdr_pem_path = tmpdir.join(format!("wwdr-{job_id}.pem"));
+                    let _ = std::fs::write(&wwdr_pem_path, &out.stdout);
+                    let _ = std::process::Command::new("security")
+                        .args(["import", wwdr_pem_path.to_str().unwrap_or(""), "-k", &kc_name])
+                        .status();
+                    let _ = std::fs::remove_file(&wwdr_pem_path);
+                }
+            }
+        }
+
         // 5. Detect the signing identity from the keychain
         let out = std::process::Command::new("security")
             .args(["find-identity", "-v", "-p", "codesigning", &kc_name])
