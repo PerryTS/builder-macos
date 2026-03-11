@@ -9,6 +9,12 @@ use std::sync::Arc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
+/// How often to send a WebSocket ping to the hub (seconds).
+const PING_INTERVAL_SECS: u64 = 30;
+
+/// If no message (including pong) is received for this long, consider the connection dead.
+const STALE_TIMEOUT_SECS: u64 = 90;
+
 /// Upload a built artifact to the hub via HTTP POST (base64-encoded body).
 async fn upload_artifact(
     url: &str,
@@ -104,17 +110,21 @@ enum WorkerMessage {
 pub async fn run_worker(config: WorkerConfig) {
     tracing::info!("Perry-ship worker starting, connecting to hub: {}", config.hub_ws_url);
 
+    let mut backoff_secs = 1u64;
+
     loop {
         match connect_and_run(&config).await {
             Ok(_) => {
                 tracing::info!("Connection to hub closed, reconnecting in 5s...");
+                backoff_secs = 1; // reset backoff on clean close
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
             Err(e) => {
-                tracing::error!("Connection error: {e}, reconnecting in 5s...");
+                tracing::error!("Connection error: {e}, reconnecting in {backoff_secs}s...");
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(60); // exponential backoff, max 60s
             }
         }
-
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 }
 
@@ -145,351 +155,367 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
     // Track current cancellation flag
     let cancelled = Arc::new(AtomicBool::new(false));
 
-    while let Some(msg) = read.next().await {
-        let msg = match msg {
-            Ok(m) => m,
-            Err(e) => {
-                return Err(format!("WebSocket error: {e}"));
-            }
-        };
+    // Heartbeat state
+    let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(PING_INTERVAL_SECS));
+    ping_interval.tick().await; // consume the immediate first tick
+    let mut last_message_at = tokio::time::Instant::now();
 
-        let text = match msg {
-            Message::Text(t) => t,
-            Message::Ping(data) => {
-                let _ = write.send(Message::Pong(data)).await;
-                continue;
-            }
-            Message::Close(_) => break,
-            _ => continue,
-        };
+    loop {
+        tokio::select! {
+            biased;
 
-        let hub_msg: HubMessage = match serde_json::from_str(&text) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("Failed to parse hub message: {e}");
-                continue;
-            }
-        };
+            // Incoming WebSocket message
+            msg = read.next() => {
+                let msg = match msg {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => {
+                        return Err(format!("WebSocket error: {e}"));
+                    }
+                    None => break, // stream ended
+                };
 
-        match hub_msg {
-            HubMessage::JobAssign {
-                job_id,
-                manifest,
-                credentials,
-                tarball_url,
-                artifact_upload_url,
-            } => {
-                tracing::info!(job_id = %job_id, "Received job assignment");
+                last_message_at = tokio::time::Instant::now();
 
-                // Reset cancellation flag
-                cancelled.store(false, Ordering::Relaxed);
+                let text = match msg {
+                    Message::Text(t) => t,
+                    Message::Ping(data) => {
+                        let _ = write.send(Message::Pong(data)).await;
+                        continue;
+                    }
+                    Message::Pong(_) => {
+                        // Hub responded to our ping — connection is alive
+                        continue;
+                    }
+                    Message::Close(_) => break,
+                    _ => continue,
+                };
 
-                // Parse manifest and credentials
-                let manifest: crate::queue::job::BuildManifest =
-                    match serde_json::from_value(manifest) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            let err_msg = format!("Invalid manifest: {e}");
-                            tracing::error!("{err_msg}");
-                            let error_json = serde_json::to_string(&ServerMessage::Error {
-                                code: ErrorCode::InternalError,
-                                message: err_msg,
-                                stage: None,
-                            })
-                            .unwrap();
-                            let _ = write.send(Message::Text(error_json.into())).await;
-                            let complete_json =
-                                serde_json::to_string(&serde_json::json!({
-                                    "type": "complete",
-                                    "job_id": job_id,
-                                    "success": false,
-                                    "duration_secs": 0.0,
-                                    "artifacts": []
-                                }))
-                                .unwrap();
-                            let _ = write.send(Message::Text(complete_json.into())).await;
-                            continue;
-                        }
-                    };
-
-                let credentials: crate::queue::job::BuildCredentials =
-                    match serde_json::from_value(credentials) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            let err_msg = format!("Invalid credentials: {e}");
-                            tracing::error!("{err_msg}");
-                            let error_json = serde_json::to_string(&ServerMessage::Error {
-                                code: ErrorCode::InternalError,
-                                message: err_msg,
-                                stage: None,
-                            })
-                            .unwrap();
-                            let _ = write.send(Message::Text(error_json.into())).await;
-                            let complete_json =
-                                serde_json::to_string(&serde_json::json!({
-                                    "type": "complete",
-                                    "job_id": job_id,
-                                    "success": false,
-                                    "duration_secs": 0.0,
-                                    "artifacts": []
-                                }))
-                                .unwrap();
-                            let _ = write.send(Message::Text(complete_json.into())).await;
-                            continue;
-                        }
-                    };
-
-                // Download tarball from hub
-                let tarball_path = match download_tarball(&tarball_url, &job_id).await {
-                    Ok(p) => p,
+                let hub_msg: HubMessage = match serde_json::from_str(&text) {
+                    Ok(m) => m,
                     Err(e) => {
-                        let err_msg = format!("Failed to download tarball: {e}");
-                        tracing::error!(job_id = %job_id, "{err_msg}");
-                        let error_json = serde_json::to_string(&ServerMessage::Error {
-                            code: ErrorCode::InternalError,
-                            message: err_msg,
-                            stage: None,
-                        })
-                        .unwrap();
-                        let _ = write.send(Message::Text(error_json.into())).await;
-                        let complete_json =
-                            serde_json::to_string(&serde_json::json!({
-                                "type": "complete",
-                                "job_id": job_id,
-                                "success": false,
-                                "duration_secs": 0.0,
-                                "artifacts": []
-                            }))
-                            .unwrap();
-                        let _ = write.send(Message::Text(complete_json.into())).await;
+                        tracing::warn!("Failed to parse hub message: {e}");
                         continue;
                     }
                 };
 
-                let build_target = manifest.targets.first().cloned().unwrap_or_else(|| "macos".into());
+                match hub_msg {
+                    HubMessage::JobAssign {
+                        job_id,
+                        manifest,
+                        credentials,
+                        tarball_url,
+                        artifact_upload_url,
+                    } => {
+                        tracing::info!(job_id = %job_id, "Received job assignment");
 
-                let request = BuildRequest {
-                    manifest,
-                    credentials,
-                    tarball_path,
-                    job_id: job_id.clone(),
-                };
+                        // Reset cancellation flag
+                        cancelled.store(false, Ordering::Relaxed);
 
-                // Create progress sender that forwards to hub WS
-                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
+                        // Handle the build (this borrows read/write for progress forwarding)
+                        handle_build(
+                            config,
+                            &mut read,
+                            &mut write,
+                            &cancelled,
+                            job_id,
+                            manifest,
+                            credentials,
+                            tarball_url,
+                            artifact_upload_url,
+                        ).await?;
 
-                // Run build and forward progress, while also listening for cancel messages
-                let build_config = config.clone();
-                let cancelled_for_build = cancelled.clone();
-                let (build_result_tx, build_result_rx) =
-                    tokio::sync::oneshot::channel::<Result<PathBuf, String>>();
-
-                // Spawn build task
-                tokio::spawn(async move {
-                    let result = pipeline::execute_build(
-                        &request,
-                        &build_config,
-                        cancelled_for_build,
-                        progress_tx,
-                    )
-                    .await;
-                    // Clean up downloaded tarball
-                    std::fs::remove_file(&request.tarball_path).ok();
-                    let _ = build_result_tx.send(result);
-                });
-
-                // Select between progress messages, cancel messages from hub, and build completion
-                let start = std::time::Instant::now();
-                let mut build_result: Option<Result<PathBuf, String>> = None;
-
-                // Pin the oneshot so we can borrow it across select iterations
-                tokio::pin!(build_result_rx);
-                let mut build_done = false;
-                let mut progress_done = false;
-
-                loop {
-                    tokio::select! {
-                        biased;
-
-                        // Build completion (check first to avoid missing it)
-                        result = &mut build_result_rx, if !build_done => {
-                            build_result = result.ok();
-                            build_done = true;
-                            if progress_done {
-                                break;
-                            }
-                        }
-
-                        // Forward progress to hub
-                        progress = progress_rx.recv(), if !progress_done => {
-                            match progress {
-                                Some(msg) => {
-                                    // Add job_id to the message for hub routing
-                                    let mut json_val = serde_json::to_value(&msg).unwrap_or_default();
-                                    if let serde_json::Value::Object(ref mut map) = json_val {
-                                        map.insert("job_id".into(), serde_json::Value::String(job_id.clone()));
-                                    }
-                                    let json = serde_json::to_string(&json_val).unwrap();
-                                    let _ = write.send(Message::Text(json.into())).await;
-                                }
-                                None => {
-                                    // Channel closed, build task done sending progress
-                                    progress_done = true;
-                                    if build_done {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        // Check for hub messages (cancel)
-                        ws_msg = read.next() => {
-                            match ws_msg {
-                                Some(Ok(Message::Text(text))) => {
-                                    if let Ok(hub_msg) = serde_json::from_str::<HubMessage>(&text) {
-                                        if let HubMessage::Cancel { job_id: cancel_id } = hub_msg {
-                                            if cancel_id == job_id {
-                                                tracing::info!(job_id = %job_id, "Cancelling build");
-                                                cancelled.store(true, Ordering::Relaxed);
-                                            }
-                                        }
-                                    }
-                                }
-                                Some(Ok(Message::Ping(data))) => {
-                                    let _ = write.send(Message::Pong(data)).await;
-                                }
-                                Some(Ok(Message::Close(_))) | None => {
-                                    // Hub disconnected
-                                    return Err("Hub disconnected during build".into());
-                                }
-                                _ => {}
-                            }
-                        }
+                        // Reset heartbeat timer after build completes
+                        last_message_at = tokio::time::Instant::now();
                     }
-                }
 
-                // Drain remaining progress messages
-                while let Ok(msg) = progress_rx.try_recv() {
-                    let mut json_val = serde_json::to_value(&msg).unwrap_or_default();
-                    if let serde_json::Value::Object(ref mut map) = json_val {
-                        map.insert("job_id".into(), serde_json::Value::String(job_id.clone()));
-                    }
-                    let json = serde_json::to_string(&json_val).unwrap();
-                    let _ = write.send(Message::Text(json.into())).await;
-                }
-
-                let duration_secs = start.elapsed().as_secs_f64();
-
-                match build_result {
-                    Some(Ok(artifact_path)) => {
-                        // Compute artifact metadata
-                        let artifact_name = artifact_path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("artifact")
-                            .to_string();
-                        let metadata = std::fs::metadata(&artifact_path).ok();
-                        let size = metadata.map(|m| m.len()).unwrap_or(0);
-                        let sha256 = compute_sha256(&artifact_path).unwrap_or_default();
-                        let target = build_target.as_str();
-
-                        // Upload artifact to hub via HTTP (hub notifies CLI clients)
-                        if let Some(ref upload_url) = artifact_upload_url {
-                            match upload_artifact(upload_url, &artifact_path, &artifact_name, &sha256, target).await {
-                                Ok(resp) => {
-                                    tracing::info!(job_id = %job_id, "Artifact uploaded: {}", resp);
-                                }
-                                Err(e) => {
-                                    tracing::error!(job_id = %job_id, "Artifact upload failed: {e}");
-                                    let error_msg = serde_json::to_string(&serde_json::json!({
-                                        "type": "error",
-                                        "job_id": job_id,
-                                        "code": "INTERNAL_ERROR",
-                                        "message": format!("Artifact upload failed: {e}"),
-                                    }))
-                                    .unwrap();
-                                    let _ = write.send(Message::Text(error_msg.into())).await;
-                                }
-                            }
-                        } else {
-                            // Fallback: send artifact_ready via WS (self-hosted / same-machine)
-                            let artifact_msg = serde_json::to_string(&serde_json::json!({
-                                "type": "artifact_ready",
-                                "job_id": job_id,
-                                "target": target,
-                                "path": artifact_path.to_string_lossy(),
-                                "artifact_name": artifact_name,
-                                "sha256": sha256,
-                                "size": size,
-                            }))
-                            .unwrap();
-                            let _ = write.send(Message::Text(artifact_msg.into())).await;
-                        }
-
-                        // Clean up local artifact file
-                        std::fs::remove_file(&artifact_path).ok();
-
-                        // Send complete
-                        let complete_msg = serde_json::to_string(&serde_json::json!({
-                            "type": "complete",
-                            "job_id": job_id,
-                            "success": true,
-                            "duration_secs": duration_secs,
-                            "artifacts": [{
-                                "name": artifact_name,
-                                "size": size,
-                                "sha256": sha256,
-                            }]
-                        }))
-                        .unwrap();
-                        let _ = write.send(Message::Text(complete_msg.into())).await;
-
-                        tracing::info!(job_id = %job_id, "Build completed in {:.1}s", duration_secs);
-                    }
-                    Some(Err(err_msg)) => {
-                        tracing::error!(job_id = %job_id, error = %err_msg, "Build failed");
-                        let error_msg = serde_json::to_string(&serde_json::json!({
-                            "type": "error",
-                            "job_id": job_id,
-                            "code": "INTERNAL_ERROR",
-                            "message": err_msg,
-                            "stage": serde_json::Value::Null,
-                        }))
-                        .unwrap();
-                        let _ = write.send(Message::Text(error_msg.into())).await;
-
-                        let complete_msg = serde_json::to_string(&serde_json::json!({
-                            "type": "complete",
-                            "job_id": job_id,
-                            "success": false,
-                            "duration_secs": duration_secs,
-                            "artifacts": []
-                        }))
-                        .unwrap();
-                        let _ = write.send(Message::Text(complete_msg.into())).await;
-                    }
-                    None => {
-                        tracing::error!(job_id = %job_id, "Build task panicked");
-                        let complete_msg = serde_json::to_string(&serde_json::json!({
-                            "type": "complete",
-                            "job_id": job_id,
-                            "success": false,
-                            "duration_secs": duration_secs,
-                            "artifacts": []
-                        }))
-                        .unwrap();
-                        let _ = write.send(Message::Text(complete_msg.into())).await;
+                    HubMessage::Cancel { job_id } => {
+                        tracing::info!(job_id = %job_id, "Cancel request (no active build for this job)");
                     }
                 }
             }
 
-            HubMessage::Cancel { job_id } => {
-                tracing::info!(job_id = %job_id, "Cancel request (no active build for this job)");
+            // Send periodic ping to detect dead connections
+            _ = ping_interval.tick() => {
+                let stale_duration = last_message_at.elapsed();
+                if stale_duration > std::time::Duration::from_secs(STALE_TIMEOUT_SECS) {
+                    return Err(format!(
+                        "Connection stale: no message received for {}s, reconnecting",
+                        stale_duration.as_secs()
+                    ));
+                }
+
+                if let Err(e) = write.send(Message::Ping(vec![].into())).await {
+                    return Err(format!("Failed to send ping: {e}"));
+                }
             }
         }
     }
 
     Ok(())
+}
+
+/// Handle a single build job, forwarding progress and listening for cancel messages.
+async fn handle_build(
+    config: &WorkerConfig,
+    read: &mut futures::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
+    write: &mut futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
+    cancelled: &Arc<AtomicBool>,
+    job_id: String,
+    manifest: serde_json::Value,
+    credentials: serde_json::Value,
+    tarball_url: String,
+    artifact_upload_url: Option<String>,
+) -> Result<(), String> {
+    // Parse manifest and credentials
+    let manifest: crate::queue::job::BuildManifest =
+        match serde_json::from_value(manifest) {
+            Ok(m) => m,
+            Err(e) => {
+                let err_msg = format!("Invalid manifest: {e}");
+                tracing::error!("{err_msg}");
+                send_error(write, &job_id, &err_msg).await;
+                send_complete(write, &job_id, false, 0.0).await;
+                return Ok(());
+            }
+        };
+
+    let credentials: crate::queue::job::BuildCredentials =
+        match serde_json::from_value(credentials) {
+            Ok(c) => c,
+            Err(e) => {
+                let err_msg = format!("Invalid credentials: {e}");
+                tracing::error!("{err_msg}");
+                send_error(write, &job_id, &err_msg).await;
+                send_complete(write, &job_id, false, 0.0).await;
+                return Ok(());
+            }
+        };
+
+    // Download tarball from hub
+    let tarball_path = match download_tarball(&tarball_url, &job_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            let err_msg = format!("Failed to download tarball: {e}");
+            tracing::error!(job_id = %job_id, "{err_msg}");
+            send_error(write, &job_id, &err_msg).await;
+            send_complete(write, &job_id, false, 0.0).await;
+            return Ok(());
+        }
+    };
+
+    let build_target = manifest.targets.first().cloned().unwrap_or_else(|| "macos".into());
+
+    let request = BuildRequest {
+        manifest,
+        credentials,
+        tarball_path,
+        job_id: job_id.clone(),
+    };
+
+    // Create progress sender that forwards to hub WS
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
+
+    // Run build and forward progress
+    let build_config = config.clone();
+    let cancelled_for_build = cancelled.clone();
+    let (build_result_tx, build_result_rx) =
+        tokio::sync::oneshot::channel::<Result<PathBuf, String>>();
+
+    // Spawn build task
+    tokio::spawn(async move {
+        let result = pipeline::execute_build(
+            &request,
+            &build_config,
+            cancelled_for_build,
+            progress_tx,
+        )
+        .await;
+        // Clean up downloaded tarball
+        std::fs::remove_file(&request.tarball_path).ok();
+        let _ = build_result_tx.send(result);
+    });
+
+    let start = std::time::Instant::now();
+    let mut build_result: Option<Result<PathBuf, String>> = None;
+
+    tokio::pin!(build_result_rx);
+    let mut build_done = false;
+    let mut progress_done = false;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            // Build completion
+            result = &mut build_result_rx, if !build_done => {
+                build_result = result.ok();
+                build_done = true;
+                if progress_done {
+                    break;
+                }
+            }
+
+            // Forward progress to hub
+            progress = progress_rx.recv(), if !progress_done => {
+                match progress {
+                    Some(msg) => {
+                        let mut json_val = serde_json::to_value(&msg).unwrap_or_default();
+                        if let serde_json::Value::Object(ref mut map) = json_val {
+                            map.insert("job_id".into(), serde_json::Value::String(job_id.clone()));
+                        }
+                        let json = serde_json::to_string(&json_val).unwrap();
+                        let _ = write.send(Message::Text(json.into())).await;
+                    }
+                    None => {
+                        progress_done = true;
+                        if build_done {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Check for hub messages (cancel, ping)
+            ws_msg = read.next() => {
+                match ws_msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(hub_msg) = serde_json::from_str::<HubMessage>(&text) {
+                            if let HubMessage::Cancel { job_id: cancel_id } = hub_msg {
+                                if cancel_id == job_id {
+                                    tracing::info!(job_id = %job_id, "Cancelling build");
+                                    cancelled.store(true, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = write.send(Message::Pong(data)).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        return Err("Hub disconnected during build".into());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Drain remaining progress messages
+    while let Ok(msg) = progress_rx.try_recv() {
+        let mut json_val = serde_json::to_value(&msg).unwrap_or_default();
+        if let serde_json::Value::Object(ref mut map) = json_val {
+            map.insert("job_id".into(), serde_json::Value::String(job_id.clone()));
+        }
+        let json = serde_json::to_string(&json_val).unwrap();
+        let _ = write.send(Message::Text(json.into())).await;
+    }
+
+    let duration_secs = start.elapsed().as_secs_f64();
+
+    match build_result {
+        Some(Ok(artifact_path)) => {
+            let artifact_name = artifact_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("artifact")
+                .to_string();
+            let metadata = std::fs::metadata(&artifact_path).ok();
+            let size = metadata.map(|m| m.len()).unwrap_or(0);
+            let sha256 = compute_sha256(&artifact_path).unwrap_or_default();
+            let target = build_target.as_str();
+
+            if let Some(ref upload_url) = artifact_upload_url {
+                match upload_artifact(upload_url, &artifact_path, &artifact_name, &sha256, target).await {
+                    Ok(resp) => {
+                        tracing::info!(job_id = %job_id, "Artifact uploaded: {}", resp);
+                    }
+                    Err(e) => {
+                        tracing::error!(job_id = %job_id, "Artifact upload failed: {e}");
+                        let error_msg = serde_json::to_string(&serde_json::json!({
+                            "type": "error",
+                            "job_id": job_id,
+                            "code": "INTERNAL_ERROR",
+                            "message": format!("Artifact upload failed: {e}"),
+                        }))
+                        .unwrap();
+                        let _ = write.send(Message::Text(error_msg.into())).await;
+                    }
+                }
+            } else {
+                let artifact_msg = serde_json::to_string(&serde_json::json!({
+                    "type": "artifact_ready",
+                    "job_id": job_id,
+                    "target": target,
+                    "path": artifact_path.to_string_lossy(),
+                    "artifact_name": artifact_name,
+                    "sha256": sha256,
+                    "size": size,
+                }))
+                .unwrap();
+                let _ = write.send(Message::Text(artifact_msg.into())).await;
+            }
+
+            std::fs::remove_file(&artifact_path).ok();
+
+            let complete_msg = serde_json::to_string(&serde_json::json!({
+                "type": "complete",
+                "job_id": job_id,
+                "success": true,
+                "duration_secs": duration_secs,
+                "artifacts": [{
+                    "name": artifact_name,
+                    "size": size,
+                    "sha256": sha256,
+                }]
+            }))
+            .unwrap();
+            let _ = write.send(Message::Text(complete_msg.into())).await;
+
+            tracing::info!(job_id = %job_id, "Build completed in {:.1}s", duration_secs);
+        }
+        Some(Err(err_msg)) => {
+            tracing::error!(job_id = %job_id, error = %err_msg, "Build failed");
+            send_error(write, &job_id, &err_msg).await;
+            send_complete(write, &job_id, false, duration_secs).await;
+        }
+        None => {
+            tracing::error!(job_id = %job_id, "Build task panicked");
+            send_complete(write, &job_id, false, duration_secs).await;
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_error(
+    write: &mut futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
+    job_id: &str,
+    message: &str,
+) {
+    let error_json = serde_json::to_string(&ServerMessage::Error {
+        code: ErrorCode::InternalError,
+        message: message.to_string(),
+        stage: None,
+    })
+    .unwrap();
+    let _ = write.send(Message::Text(error_json.into())).await;
+}
+
+async fn send_complete(
+    write: &mut futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
+    job_id: &str,
+    success: bool,
+    duration_secs: f64,
+) {
+    let complete_json = serde_json::to_string(&serde_json::json!({
+        "type": "complete",
+        "job_id": job_id,
+        "success": success,
+        "duration_secs": duration_secs,
+        "artifacts": []
+    }))
+    .unwrap();
+    let _ = write.send(Message::Text(complete_json.into())).await;
 }
 
 fn compute_sha256(path: &PathBuf) -> Result<String, String> {
