@@ -278,8 +278,8 @@ async fn run_macos_pipeline(
         send_stage(progress, StageName::Packaging, "Creating installer package (.pkg)");
         check_cancelled(cancelled)?;
         let pkg_path = tmpdir.join(format!("{}.pkg", request.manifest.app_name));
-        let installer_identity = appstore_identity
-            .map(|id| id.replace("Mac Developer Application:", "Mac Developer Installer:"))
+        let installer_identity = appstore_kc.as_ref()
+            .and_then(|kc| apple::find_installer_identity(&kc.path))
             .unwrap_or_default();
         if let Some(ref kc) = appstore_kc {
             let _ = kc.add_to_search_list();
@@ -366,8 +366,8 @@ async fn run_macos_pipeline(
             send_stage(progress, StageName::Packaging, "Creating installer package (.pkg)");
             check_cancelled(cancelled)?;
             let pkg_path = tmpdir.join(format!("{}.pkg", request.manifest.app_name));
-            let installer_identity = effective_identity
-                .map(|id| id.replace("Mac Developer Application:", "Mac Developer Installer:"))
+            let installer_identity = temp_kc.as_ref()
+                .and_then(|kc| apple::find_installer_identity(&kc.path))
                 .unwrap_or_default();
             if let Some(ref kc) = temp_kc {
                 let _ = kc.add_to_search_list();

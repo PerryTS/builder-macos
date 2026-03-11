@@ -190,6 +190,30 @@ impl Drop for TempKeychain {
     }
 }
 
+/// Find an installer signing identity from this keychain.
+/// Looks for "3rd Party Mac Developer Installer" or "Mac Developer Installer" identities.
+pub fn find_installer_identity(kc_name: &str) -> Option<String> {
+    let out = std::process::Command::new("security")
+        .args(["find-identity", "-v", kc_name])
+        .output()
+        .ok()?;
+    let output = String::from_utf8_lossy(&out.stdout);
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(start) = line.find('"') {
+            if let Some(end) = line.rfind('"') {
+                if end > start {
+                    let identity = &line[start + 1..end];
+                    if identity.contains("Installer") {
+                        return Some(identity.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn parse_identity_from_find_output(output: &str) -> Option<String> {
     // Lines look like:   1) DEADBEEF "iPhone Distribution: Foo Corp (TEAMID)"
     for line in output.lines() {
