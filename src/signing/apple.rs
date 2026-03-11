@@ -57,7 +57,7 @@ impl TempKeychain {
             .args(["set-keychain-settings", "-lut", "7200", &kc_name])
             .status();
 
-        // 3. Import .p12 (-T flags allow codesign and productsign without UI prompt)
+        // 3. Import .p12 (-T flags allow codesign, productsign, productbuild without UI prompt)
         let out = std::process::Command::new("security")
             .args([
                 "import", p12_path.to_str().unwrap_or(""),
@@ -65,6 +65,7 @@ impl TempKeychain {
                 "-P", p12_password,
                 "-T", "/usr/bin/codesign",
                 "-T", "/usr/bin/productsign",
+                "-T", "/usr/bin/productbuild",
             ])
             .output()
             .map_err(|e| format!("Failed to run security import: {e}"))?;
@@ -77,11 +78,11 @@ impl TempKeychain {
         // Immediately remove p12 from disk
         let _ = std::fs::remove_file(&p12_path);
 
-        // 4. Allow partition access (suppresses UI auth dialogs for codesign)
+        // 4. Allow partition access (suppresses UI auth dialogs for codesign/productbuild)
         let out = std::process::Command::new("security")
             .args([
                 "set-key-partition-list",
-                "-S", "apple-tool:,apple:,codesign:",
+                "-S", "apple-tool:,apple:,codesign:,productbuild:",
                 "-s",
                 "-k", &kc_password,
                 &kc_name,
@@ -102,7 +103,7 @@ impl TempKeychain {
         ] {
             // Export WWDR certs from system keychain and import into our temp keychain
             let export_out = std::process::Command::new("security")
-                .args(["find-certificate", "-c", "Apple Worldwide Developer Relations", "-p", wwdr_path])
+                .args(["find-certificate", "-a", "-c", "Apple Worldwide Developer Relations", "-p", wwdr_path])
                 .output();
             if let Ok(ref out) = export_out {
                 if out.status.success() && !out.stdout.is_empty() {
@@ -133,6 +134,59 @@ impl TempKeychain {
         let kc_path = format!("{home}/Library/Keychains/{kc_name}-db");
 
         Ok(TempKeychain { path: kc_path, identity, kc_password })
+    }
+
+    /// Import an additional .p12 certificate into this keychain.
+    /// Used for importing the installer cert separately from the app cert.
+    pub fn import_additional_p12(
+        &self,
+        p12_b64: &str,
+        p12_password: &str,
+        tmpdir: &Path,
+    ) -> Result<(), String> {
+        use base64::Engine;
+        let p12_bytes = base64::engine::general_purpose::STANDARD
+            .decode(p12_b64.trim())
+            .map_err(|e| format!("Invalid base64 for additional .p12: {e}"))?;
+
+        let p12_path = tmpdir.join("additional-cert.p12");
+        std::fs::write(&p12_path, &p12_bytes)
+            .map_err(|e| format!("Failed to write additional .p12: {e}"))?;
+
+        // Derive the keychain name from path for security commands
+        let kc_name = &self.path;
+
+        let out = std::process::Command::new("security")
+            .args([
+                "import", p12_path.to_str().unwrap_or(""),
+                "-k", kc_name,
+                "-P", p12_password,
+                "-T", "/usr/bin/codesign",
+                "-T", "/usr/bin/productsign",
+                "-T", "/usr/bin/productbuild",
+            ])
+            .output()
+            .map_err(|e| format!("Failed to import additional .p12: {e}"))?;
+
+        let _ = std::fs::remove_file(&p12_path);
+
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("security import (additional .p12) failed: {stderr}"));
+        }
+
+        // Re-run partition list to cover the new key
+        let _ = std::process::Command::new("security")
+            .args([
+                "set-key-partition-list",
+                "-S", "apple-tool:,apple:,codesign:,productbuild:",
+                "-s",
+                "-k", &self.kc_password,
+                kc_name,
+            ])
+            .status();
+
+        Ok(())
     }
 
     /// Add this keychain to the user search list.
@@ -193,11 +247,14 @@ impl Drop for TempKeychain {
 /// Find an installer signing identity from this keychain.
 /// Looks for "3rd Party Mac Developer Installer" or "Mac Developer Installer" identities.
 pub fn find_installer_identity(kc_name: &str) -> Option<String> {
+    // Don't use -v (valid only) — installer certs may not pass the default
+    // validity check without the full chain, but they still work for signing.
     let out = std::process::Command::new("security")
-        .args(["find-identity", "-v", kc_name])
+        .args(["find-identity", kc_name])
         .output()
         .ok()?;
     let output = String::from_utf8_lossy(&out.stdout);
+    tracing::info!("find_installer_identity output for {kc_name}:\n{output}");
     for line in output.lines() {
         let line = line.trim();
         if let Some(start) = line.find('"') {

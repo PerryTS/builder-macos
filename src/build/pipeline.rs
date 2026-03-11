@@ -247,10 +247,18 @@ async fn run_macos_pipeline(
             request.credentials.apple_certificate_p12_base64.as_deref(),
             request.credentials.apple_certificate_password.as_deref(),
         ) {
-            Some(apple::TempKeychain::create(
+            let kc = apple::TempKeychain::create(
                 &format!("{}-appstore", request.job_id),
                 p12_b64, p12_pass, tmpdir,
-            ).await?)
+            ).await?;
+            // Import separate installer cert into same keychain if provided
+            if let (Some(inst_b64), Some(inst_pass)) = (
+                request.credentials.apple_installer_certificate_p12_base64.as_deref(),
+                request.credentials.apple_installer_certificate_password.as_deref(),
+            ) {
+                kc.import_additional_p12(inst_b64, inst_pass, tmpdir)?;
+            }
+            Some(kc)
         } else {
             None
         };
@@ -281,6 +289,9 @@ async fn run_macos_pipeline(
         let installer_identity = appstore_kc.as_ref()
             .and_then(|kc| apple::find_installer_identity(&kc.path))
             .unwrap_or_default();
+        if installer_identity.is_empty() {
+            return Err("No installer signing identity found. Ensure a Mac Installer Distribution certificate is available.".to_string());
+        }
         if let Some(ref kc) = appstore_kc {
             let _ = kc.add_to_search_list();
         }
@@ -328,7 +339,15 @@ async fn run_macos_pipeline(
             request.credentials.apple_certificate_p12_base64.as_deref(),
             request.credentials.apple_certificate_password.as_deref(),
         ) {
-            Some(apple::TempKeychain::create(&request.job_id, p12_b64, p12_pass, tmpdir).await?)
+            let kc = apple::TempKeychain::create(&request.job_id, p12_b64, p12_pass, tmpdir).await?;
+            // Import separate installer cert into same keychain if provided
+            if let (Some(inst_b64), Some(inst_pass)) = (
+                request.credentials.apple_installer_certificate_p12_base64.as_deref(),
+                request.credentials.apple_installer_certificate_password.as_deref(),
+            ) {
+                kc.import_additional_p12(inst_b64, inst_pass, tmpdir)?;
+            }
+            Some(kc)
         } else {
             None
         };

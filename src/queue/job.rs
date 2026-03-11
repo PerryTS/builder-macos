@@ -72,6 +72,12 @@ pub struct BuildCredentials {
     /// Signing identity for the Developer ID cert (e.g. "Developer ID Application: ...")
     #[serde(default)]
     pub apple_notarize_signing_identity: Option<String>,
+    /// Separate .p12 for the Mac Installer Distribution cert (for .pkg signing)
+    #[serde(default)]
+    pub apple_installer_certificate_p12_base64: Option<String>,
+    /// Password for the installer .p12 certificate
+    #[serde(default)]
+    pub apple_installer_certificate_password: Option<String>,
     /// Base64-encoded .jks keystore for Android signing
     #[serde(default)]
     pub android_keystore_base64: Option<String>,
