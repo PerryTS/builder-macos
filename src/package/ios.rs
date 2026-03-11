@@ -434,11 +434,13 @@ mod tests {
             ios_orientations: Some(vec!["portrait".into()]),
             ios_capabilities: None,
             ios_distribute: None,
+            ios_encryption_exempt: None,
             android_min_sdk: None,
             android_target_sdk: None,
             android_permissions: None,
             android_distribute: None,
             macos_distribute: None,
+            macos_encryption_exempt: None,
         };
 
         let plist = generate_ios_info_plist(&manifest, None);
@@ -471,11 +473,13 @@ mod tests {
             ios_orientations: None,
             ios_capabilities: None,
             ios_distribute: None,
+            ios_encryption_exempt: None,
             android_min_sdk: None,
             android_target_sdk: None,
             android_permissions: None,
             android_distribute: None,
             macos_distribute: None,
+            macos_encryption_exempt: None,
         };
 
         let plist = generate_ios_info_plist(&manifest, None);

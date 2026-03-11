@@ -449,11 +449,13 @@ mod tests {
             ios_orientations: None,
             ios_capabilities: None,
             ios_distribute: None,
+            ios_encryption_exempt: None,
             android_min_sdk: None,
             android_target_sdk: None,
             android_permissions: None,
             android_distribute: None,
             macos_distribute: None,
+            macos_encryption_exempt: None,
         };
 
         let xml = generate_android_manifest_xml(&manifest);
@@ -483,6 +485,7 @@ mod tests {
             ios_orientations: None,
             ios_capabilities: None,
             ios_distribute: None,
+            ios_encryption_exempt: None,
             android_min_sdk: Some("26".into()),
             android_target_sdk: Some("35".into()),
             android_permissions: Some(vec![
@@ -491,6 +494,7 @@ mod tests {
             ]),
             android_distribute: None,
             macos_distribute: None,
+            macos_encryption_exempt: None,
         };
 
         let xml = generate_android_manifest_xml(&manifest);
@@ -518,6 +522,7 @@ mod tests {
             ios_orientations: None,
             ios_capabilities: None,
             ios_distribute: None,
+            ios_encryption_exempt: None,
             android_min_sdk: None,
             android_target_sdk: None,
             android_permissions: Some(vec![
@@ -525,6 +530,7 @@ mod tests {
             ]),
             android_distribute: None,
             macos_distribute: None,
+            macos_encryption_exempt: None,
         };
 
         let xml = generate_android_manifest_xml(&manifest);

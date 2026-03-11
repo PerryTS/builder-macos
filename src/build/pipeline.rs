@@ -140,7 +140,7 @@ async fn run_macos_pipeline(
     project_dir: &std::path::Path,
 ) -> Result<PathBuf, String> {
     let distribute = request.manifest.macos_distribute.as_deref().unwrap_or("notarize");
-    let is_appstore = distribute == "appstore";
+    let is_appstore = distribute == "appstore" || distribute == "testflight";
 
     // Stage 3: Generate assets (icons)
     send_stage(progress, StageName::GeneratingAssets, "Generating app icons");

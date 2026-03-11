@@ -27,9 +27,13 @@ pub struct BuildManifest {
     pub ios_capabilities: Option<Vec<String>>,
     #[serde(default)]
     pub ios_distribute: Option<String>,
+    #[serde(default)]
+    pub ios_encryption_exempt: Option<bool>,
     // macOS-specific fields
     #[serde(default)]
     pub macos_distribute: Option<String>,
+    #[serde(default)]
+    pub macos_encryption_exempt: Option<bool>,
     // Android-specific fields
     #[serde(default)]
     pub android_min_sdk: Option<String>,

@@ -144,6 +144,13 @@ fn generate_info_plist(manifest: &BuildManifest, icon_file: Option<&str>) -> Str
         .map(|f| format!("\t<key>CFBundleIconFile</key>\n\t<string>{f}</string>\n"))
         .unwrap_or_default();
 
+    let encryption_entry = manifest.macos_encryption_exempt
+        .map(|exempt| {
+            let value = if exempt { "<false/>" } else { "<true/>" };
+            format!("\t<key>ITSAppUsesNonExemptEncryption</key>\n\t{value}\n")
+        })
+        .unwrap_or_default();
+
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -159,7 +166,7 @@ fn generate_info_plist(manifest: &BuildManifest, icon_file: Option<&str>) -> Str
 	<string>{version}</string>
 	<key>CFBundleShortVersionString</key>
 	<string>{short_version}</string>
-{icon_entry}	<key>LSMinimumSystemVersion</key>
+{icon_entry}{encryption_entry}	<key>LSMinimumSystemVersion</key>
 	<string>{min_os}</string>
 	<key>LSApplicationCategoryType</key>
 	<string>{category}</string>
@@ -244,11 +251,13 @@ mod tests {
             ios_orientations: None,
             ios_capabilities: None,
             ios_distribute: None,
+            ios_encryption_exempt: None,
             android_min_sdk: None,
             android_target_sdk: None,
             android_permissions: None,
             android_distribute: None,
             macos_distribute: None,
+            macos_encryption_exempt: None,
         };
 
         let plist = generate_info_plist(&manifest, Some("AppIcon.icns"));
@@ -279,11 +288,13 @@ mod tests {
             ios_orientations: None,
             ios_capabilities: None,
             ios_distribute: None,
+            ios_encryption_exempt: None,
             android_min_sdk: None,
             android_target_sdk: None,
             android_permissions: None,
             android_distribute: None,
             macos_distribute: None,
+            macos_encryption_exempt: None,
         };
 
         let plist = generate_info_plist(&manifest, None);
