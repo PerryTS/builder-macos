@@ -137,7 +137,7 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
 
     // Send worker_hello
     let hello = WorkerMessage::WorkerHello {
-        capabilities: vec!["macos".into(), "ios".into(), "android".into()],
+        capabilities: vec!["macos".into(), "ios".into()],
         name: config.worker_name.clone().unwrap_or_else(|| {
             hostname::get()
                 .map(|h| h.to_string_lossy().to_string())

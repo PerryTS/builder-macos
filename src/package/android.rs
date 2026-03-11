@@ -48,6 +48,13 @@ pub fn create_android_project(
         create_minimal_project(&project_dir)?;
     }
 
+    // Write local.properties with SDK location for Gradle
+    if let Ok(sdk) = std::env::var("ANDROID_HOME").or_else(|_| std::env::var("ANDROID_SDK_ROOT")) {
+        let local_props = project_dir.join("local.properties");
+        std::fs::write(&local_props, format!("sdk.dir={}", sdk))
+            .map_err(|e| format!("Failed to write local.properties: {e}"))?;
+    }
+
     // Customize build.gradle.kts
     let build_gradle = project_dir.join("app/build.gradle.kts");
     if build_gradle.exists() {
