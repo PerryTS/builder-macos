@@ -63,6 +63,15 @@ pub struct BuildCredentials {
     /// Password for the .p12 certificate bundle. Never persisted.
     #[serde(default)]
     pub apple_certificate_password: Option<String>,
+    /// For macOS distribute = "both": separate Developer ID cert for notarization
+    #[serde(default)]
+    pub apple_notarize_certificate_p12_base64: Option<String>,
+    /// Password for the notarize .p12 certificate
+    #[serde(default)]
+    pub apple_notarize_certificate_password: Option<String>,
+    /// Signing identity for the Developer ID cert (e.g. "Developer ID Application: ...")
+    #[serde(default)]
+    pub apple_notarize_signing_identity: Option<String>,
     /// Base64-encoded .jks keystore for Android signing
     #[serde(default)]
     pub android_keystore_base64: Option<String>,

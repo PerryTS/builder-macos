@@ -141,6 +141,7 @@ async fn run_macos_pipeline(
 ) -> Result<PathBuf, String> {
     let distribute = request.manifest.macos_distribute.as_deref().unwrap_or("notarize");
     let is_appstore = distribute == "appstore" || distribute == "testflight";
+    let is_both = distribute == "both";
 
     // Stage 3: Generate assets (icons)
     send_stage(progress, StageName::GeneratingAssets, "Generating app icons");
@@ -162,110 +163,54 @@ async fn run_macos_pipeline(
     macos::create_app_bundle(&request.manifest, binary_path, icns_opt, &app_path)?;
     send_progress(progress, StageName::Bundling, 100, None);
 
-    // Stage 5: Code sign
-    send_stage(progress, StageName::Signing, "Signing application");
-    check_cancelled(cancelled)?;
+    if is_both {
+        // --- "both" mode: two passes ---
+        // Pass 1: Sign with Developer ID → create DMG → notarize
+        // Pass 2: Re-sign with Apple Distribution → create .pkg → upload to App Store Connect
 
-    // Resolve signing identity: p12 (temp keychain) takes priority over pre-installed cert
-    let temp_kc = if let (Some(p12_b64), Some(p12_pass)) = (
-        request.credentials.apple_certificate_p12_base64.as_deref(),
-        request.credentials.apple_certificate_password.as_deref(),
-    ) {
-        Some(apple::TempKeychain::create(&request.job_id, p12_b64, p12_pass, tmpdir).await?)
-    } else {
-        None
-    };
-    let effective_identity = temp_kc.as_ref()
-        .map(|kc| kc.identity.as_str())
-        .or_else(|| request.credentials.apple_signing_identity.as_deref());
+        // -- Pass 1: Notarize DMG --
+        send_stage(progress, StageName::Signing, "Signing with Developer ID (for notarization)");
+        check_cancelled(cancelled)?;
 
-    if let Some(identity) = effective_identity {
-        let entitlements_path = if request.manifest.entitlements.is_some() {
-            let p = tmpdir.join("entitlements.plist");
-            macos::write_entitlements_plist(&request.manifest, &p)?;
-            Some(p)
+        let notarize_kc = if let (Some(p12_b64), Some(p12_pass)) = (
+            request.credentials.apple_notarize_certificate_p12_base64.as_deref(),
+            request.credentials.apple_notarize_certificate_password.as_deref(),
+        ) {
+            Some(apple::TempKeychain::create(
+                &format!("{}-notarize", request.job_id),
+                p12_b64, p12_pass, tmpdir,
+            ).await?)
         } else {
             None
         };
-        // Add temp keychain to search list so codesign can find the private key
-        if let Some(ref kc) = temp_kc {
-            kc.add_to_search_list().map_err(|e| format!("Failed to add keychain to search list: {e}"))?;
+        let notarize_identity = notarize_kc.as_ref()
+            .map(|kc| kc.identity.as_str())
+            .or_else(|| request.credentials.apple_notarize_signing_identity.as_deref());
+
+        if let Some(identity) = notarize_identity {
+            let entitlements_path = if request.manifest.entitlements.is_some() {
+                let p = tmpdir.join("entitlements.plist");
+                macos::write_entitlements_plist(&request.manifest, &p)?;
+                Some(p)
+            } else {
+                None
+            };
+            if let Some(ref kc) = notarize_kc {
+                kc.add_to_search_list().map_err(|e| format!("Failed to add keychain to search list: {e}"))?;
+            }
+            let kc_path = notarize_kc.as_ref().map(|kc| kc.path.as_str());
+            apple::codesign_app(identity, entitlements_path.as_deref(), &app_path, true, kc_path).await?;
         }
-        let kc_path = temp_kc.as_ref().map(|kc| kc.path.as_str());
-        apple::codesign_app(
-            identity,
-            entitlements_path.as_deref(),
-            &app_path,
-            !is_appstore, // hardened runtime for notarization, not needed for App Store
-            kc_path,
-        )
-        .await?;
-    }
-    send_progress(progress, StageName::Signing, 100, None);
+        send_progress(progress, StageName::Signing, 50, Some("Developer ID signed"));
 
-    if is_appstore {
-        // App Store path: create .pkg and upload to App Store Connect
-
-        // Stage 6: Package .pkg
-        send_stage(progress, StageName::Packaging, "Creating installer package (.pkg)");
-        check_cancelled(cancelled)?;
-        let pkg_path = tmpdir.join(format!("{}.pkg", request.manifest.app_name));
-        // Derive installer identity from effective identity
-        let installer_identity = effective_identity
-            .map(|id| id.replace("Mac Developer Application:", "Mac Developer Installer:"))
-            .unwrap_or_default();
-        // productsign searches the keychain list — add temp keychain if present
-        if let Some(ref kc) = temp_kc {
-            let _ = kc.add_to_search_list();
-        }
-        macos::create_pkg(&app_path, &pkg_path, &installer_identity).await?;
-        if let Some(ref kc) = temp_kc {
-            kc.remove_from_search_list();
-        }
-        send_progress(progress, StageName::Packaging, 100, None);
-
-        // Stage 7: Upload to App Store Connect
-        let has_creds = request.credentials.apple_key_id.is_some()
-            && request.credentials.apple_issuer_id.is_some()
-            && request.credentials.apple_p8_key.is_some();
-        if !has_creds {
-            return Err(
-                "macos.distribute = \"appstore\" requires App Store Connect API credentials. \
-                 Run `perry setup macos` or pass --apple-key-id / --apple-issuer-id / --apple-p8-key."
-                    .to_string(),
-            );
-        }
-        send_stage(progress, StageName::Publishing, "Uploading to App Store Connect");
-        check_cancelled(cancelled)?;
-        let result = appstore::upload_macos_to_appstore(
-            &pkg_path,
-            request.credentials.apple_p8_key.as_deref().unwrap(),
-            request.credentials.apple_key_id.as_deref().unwrap(),
-            request.credentials.apple_issuer_id.as_deref().unwrap(),
-            tmpdir,
-        )
-        .await?;
-        let _ = progress.send(ServerMessage::Published {
-            platform: "macos".into(),
-            message: result.message,
-            url: None,
-        });
-        send_progress(progress, StageName::Publishing, 100, None);
-
-        let artifact_path = copy_artifact(&pkg_path, &request.manifest.app_name, &request.job_id, "pkg")?;
-        Ok(artifact_path)
-    } else {
-        // Notarize path: create .dmg, notarize, return DMG
-
-        // Stage 6: Package DMG
+        // Create DMG
+        let dmg_path = tmpdir.join(format!("{}.dmg", request.manifest.app_name));
         send_stage(progress, StageName::Packaging, "Creating DMG");
         check_cancelled(cancelled)?;
-        let dmg_path = tmpdir.join(format!("{}.dmg", request.manifest.app_name));
         macos::create_dmg(&request.manifest.app_name, &app_path, &dmg_path).await?;
-        send_progress(progress, StageName::Packaging, 100, None);
 
-        // Stage 7: Notarize
-        send_stage(progress, StageName::Notarizing, "Notarizing with Apple");
+        // Notarize DMG
+        send_stage(progress, StageName::Notarizing, "Notarizing DMG with Apple");
         check_cancelled(cancelled)?;
         let has_notarization = request.credentials.apple_key_id.is_some()
             && request.credentials.apple_issuer_id.is_some()
@@ -282,8 +227,218 @@ async fn run_macos_pipeline(
         }
         send_progress(progress, StageName::Notarizing, 100, None);
 
-        let artifact_path = copy_artifact(&dmg_path, &request.manifest.app_name, &request.job_id, "dmg")?;
-        Ok(artifact_path)
+        // Clean up notarize keychain
+        if let Some(ref kc) = notarize_kc {
+            kc.remove_from_search_list();
+        }
+
+        // Save DMG artifact
+        let dmg_artifact = copy_artifact(&dmg_path, &request.manifest.app_name, &request.job_id, "dmg")?;
+
+        // -- Pass 2: App Store upload --
+        // Re-create .app bundle (codesign modifies in-place, so start fresh)
+        send_stage(progress, StageName::Signing, "Re-signing with Apple Distribution (for App Store)");
+        check_cancelled(cancelled)?;
+
+        let app_path_appstore = tmpdir.join(format!("{}-appstore.app", request.manifest.app_name));
+        macos::create_app_bundle(&request.manifest, binary_path, icns_opt, &app_path_appstore)?;
+
+        let appstore_kc = if let (Some(p12_b64), Some(p12_pass)) = (
+            request.credentials.apple_certificate_p12_base64.as_deref(),
+            request.credentials.apple_certificate_password.as_deref(),
+        ) {
+            Some(apple::TempKeychain::create(
+                &format!("{}-appstore", request.job_id),
+                p12_b64, p12_pass, tmpdir,
+            ).await?)
+        } else {
+            None
+        };
+        let appstore_identity = appstore_kc.as_ref()
+            .map(|kc| kc.identity.as_str())
+            .or_else(|| request.credentials.apple_signing_identity.as_deref());
+
+        if let Some(identity) = appstore_identity {
+            let entitlements_path = if request.manifest.entitlements.is_some() {
+                let p = tmpdir.join("entitlements-appstore.plist");
+                macos::write_entitlements_plist(&request.manifest, &p)?;
+                Some(p)
+            } else {
+                None
+            };
+            if let Some(ref kc) = appstore_kc {
+                kc.add_to_search_list().map_err(|e| format!("Failed to add keychain to search list: {e}"))?;
+            }
+            let kc_path = appstore_kc.as_ref().map(|kc| kc.path.as_str());
+            apple::codesign_app(identity, entitlements_path.as_deref(), &app_path_appstore, false, kc_path).await?;
+        }
+        send_progress(progress, StageName::Signing, 100, Some("Apple Distribution signed"));
+
+        // Create .pkg
+        send_stage(progress, StageName::Packaging, "Creating installer package (.pkg)");
+        check_cancelled(cancelled)?;
+        let pkg_path = tmpdir.join(format!("{}.pkg", request.manifest.app_name));
+        let installer_identity = appstore_identity
+            .map(|id| id.replace("Mac Developer Application:", "Mac Developer Installer:"))
+            .unwrap_or_default();
+        if let Some(ref kc) = appstore_kc {
+            let _ = kc.add_to_search_list();
+        }
+        macos::create_pkg(&app_path_appstore, &pkg_path, &installer_identity).await?;
+        if let Some(ref kc) = appstore_kc {
+            kc.remove_from_search_list();
+        }
+        send_progress(progress, StageName::Packaging, 100, None);
+
+        // Upload to App Store Connect
+        if !has_notarization {
+            return Err(
+                "macos.distribute = \"both\" requires App Store Connect API credentials. \
+                 Run `perry setup macos` or pass --apple-key-id / --apple-issuer-id / --apple-p8-key."
+                    .to_string(),
+            );
+        }
+        send_stage(progress, StageName::Publishing, "Uploading to App Store Connect");
+        check_cancelled(cancelled)?;
+        let result = appstore::upload_macos_to_appstore(
+            &pkg_path,
+            request.credentials.apple_p8_key.as_deref().unwrap(),
+            request.credentials.apple_key_id.as_deref().unwrap(),
+            request.credentials.apple_issuer_id.as_deref().unwrap(),
+            tmpdir,
+        )
+        .await?;
+        let _ = progress.send(ServerMessage::Published {
+            platform: "macos".into(),
+            message: format!("{} (DMG also available)", result.message),
+            url: None,
+        });
+        send_progress(progress, StageName::Publishing, 100, None);
+
+        // Return the DMG as the primary artifact (App Store upload is done via altool)
+        Ok(dmg_artifact)
+    } else {
+        // --- Single-mode: appstore OR notarize ---
+
+        // Stage 5: Code sign
+        send_stage(progress, StageName::Signing, "Signing application");
+        check_cancelled(cancelled)?;
+
+        let temp_kc = if let (Some(p12_b64), Some(p12_pass)) = (
+            request.credentials.apple_certificate_p12_base64.as_deref(),
+            request.credentials.apple_certificate_password.as_deref(),
+        ) {
+            Some(apple::TempKeychain::create(&request.job_id, p12_b64, p12_pass, tmpdir).await?)
+        } else {
+            None
+        };
+        let effective_identity = temp_kc.as_ref()
+            .map(|kc| kc.identity.as_str())
+            .or_else(|| request.credentials.apple_signing_identity.as_deref());
+
+        if let Some(identity) = effective_identity {
+            let entitlements_path = if request.manifest.entitlements.is_some() {
+                let p = tmpdir.join("entitlements.plist");
+                macos::write_entitlements_plist(&request.manifest, &p)?;
+                Some(p)
+            } else {
+                None
+            };
+            if let Some(ref kc) = temp_kc {
+                kc.add_to_search_list().map_err(|e| format!("Failed to add keychain to search list: {e}"))?;
+            }
+            let kc_path = temp_kc.as_ref().map(|kc| kc.path.as_str());
+            apple::codesign_app(
+                identity,
+                entitlements_path.as_deref(),
+                &app_path,
+                !is_appstore, // hardened runtime for notarization, not needed for App Store
+                kc_path,
+            )
+            .await?;
+        }
+        send_progress(progress, StageName::Signing, 100, None);
+
+        if is_appstore {
+            // App Store path: create .pkg and upload to App Store Connect
+
+            // Stage 6: Package .pkg
+            send_stage(progress, StageName::Packaging, "Creating installer package (.pkg)");
+            check_cancelled(cancelled)?;
+            let pkg_path = tmpdir.join(format!("{}.pkg", request.manifest.app_name));
+            let installer_identity = effective_identity
+                .map(|id| id.replace("Mac Developer Application:", "Mac Developer Installer:"))
+                .unwrap_or_default();
+            if let Some(ref kc) = temp_kc {
+                let _ = kc.add_to_search_list();
+            }
+            macos::create_pkg(&app_path, &pkg_path, &installer_identity).await?;
+            if let Some(ref kc) = temp_kc {
+                kc.remove_from_search_list();
+            }
+            send_progress(progress, StageName::Packaging, 100, None);
+
+            // Stage 7: Upload to App Store Connect
+            let has_creds = request.credentials.apple_key_id.is_some()
+                && request.credentials.apple_issuer_id.is_some()
+                && request.credentials.apple_p8_key.is_some();
+            if !has_creds {
+                return Err(
+                    "macos.distribute = \"appstore\" requires App Store Connect API credentials. \
+                     Run `perry setup macos` or pass --apple-key-id / --apple-issuer-id / --apple-p8-key."
+                        .to_string(),
+                );
+            }
+            send_stage(progress, StageName::Publishing, "Uploading to App Store Connect");
+            check_cancelled(cancelled)?;
+            let result = appstore::upload_macos_to_appstore(
+                &pkg_path,
+                request.credentials.apple_p8_key.as_deref().unwrap(),
+                request.credentials.apple_key_id.as_deref().unwrap(),
+                request.credentials.apple_issuer_id.as_deref().unwrap(),
+                tmpdir,
+            )
+            .await?;
+            let _ = progress.send(ServerMessage::Published {
+                platform: "macos".into(),
+                message: result.message,
+                url: None,
+            });
+            send_progress(progress, StageName::Publishing, 100, None);
+
+            let artifact_path = copy_artifact(&pkg_path, &request.manifest.app_name, &request.job_id, "pkg")?;
+            Ok(artifact_path)
+        } else {
+            // Notarize path: create .dmg, notarize, return DMG
+
+            // Stage 6: Package DMG
+            send_stage(progress, StageName::Packaging, "Creating DMG");
+            check_cancelled(cancelled)?;
+            let dmg_path = tmpdir.join(format!("{}.dmg", request.manifest.app_name));
+            macos::create_dmg(&request.manifest.app_name, &app_path, &dmg_path).await?;
+            send_progress(progress, StageName::Packaging, 100, None);
+
+            // Stage 7: Notarize
+            send_stage(progress, StageName::Notarizing, "Notarizing with Apple");
+            check_cancelled(cancelled)?;
+            let has_notarization = request.credentials.apple_key_id.is_some()
+                && request.credentials.apple_issuer_id.is_some()
+                && request.credentials.apple_p8_key.is_some();
+            if has_notarization {
+                apple::notarize_dmg(
+                    &dmg_path,
+                    request.credentials.apple_p8_key.as_deref().unwrap(),
+                    request.credentials.apple_key_id.as_deref().unwrap(),
+                    request.credentials.apple_issuer_id.as_deref().unwrap(),
+                    tmpdir,
+                )
+                .await?;
+            }
+            send_progress(progress, StageName::Notarizing, 100, None);
+
+            let artifact_path = copy_artifact(&dmg_path, &request.manifest.app_name, &request.job_id, "dmg")?;
+            Ok(artifact_path)
+        }
     }
 }
 
