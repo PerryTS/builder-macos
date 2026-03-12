@@ -1,3 +1,4 @@
+use crate::build::validate::escape_xml;
 use crate::queue::job::BuildManifest;
 use std::path::Path;
 use tokio::process::Command;
@@ -141,7 +142,7 @@ fn generate_info_plist(manifest: &BuildManifest, icon_file: Option<&str>) -> Str
         .unwrap_or("public.app-category.developer-tools");
 
     let icon_entry = icon_file
-        .map(|f| format!("\t<key>CFBundleIconFile</key>\n\t<string>{f}</string>\n"))
+        .map(|f| format!("\t<key>CFBundleIconFile</key>\n\t<string>{}</string>\n", escape_xml(f)))
         .unwrap_or_default();
 
     let encryption_entry = manifest.macos_encryption_exempt
@@ -176,17 +177,20 @@ fn generate_info_plist(manifest: &BuildManifest, icon_file: Option<&str>) -> Str
 	<string>6.0</string>
 </dict>
 </plist>"#,
-        executable = manifest.app_name,
-        bundle_id = manifest.bundle_id,
-        name = manifest.app_name,
-        version = manifest.version,
+        executable = escape_xml(&manifest.app_name),
+        bundle_id = escape_xml(&manifest.bundle_id),
+        name = escape_xml(&manifest.app_name),
+        version = escape_xml(&manifest.version),
+        short_version = escape_xml(short_version),
+        min_os = escape_xml(min_os),
+        category = escape_xml(category),
     )
 }
 
 fn generate_entitlements_plist(entitlements: &[String]) -> String {
     let entries: String = entitlements
         .iter()
-        .map(|e| format!("\t<key>{e}</key>\n\t<true/>"))
+        .map(|e| format!("\t<key>{}</key>\n\t<true/>", escape_xml(e)))
         .collect::<Vec<_>>()
         .join("\n");
 

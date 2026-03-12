@@ -3,6 +3,7 @@ use crate::build::assets::{
 };
 use crate::build::cleanup::{cleanup_tmpdir, create_build_tmpdir};
 use crate::build::compiler;
+use crate::build::validate;
 use crate::config::WorkerConfig;
 use crate::package::{android, ios, macos};
 use crate::publish::{appstore, playstore};
@@ -31,6 +32,9 @@ pub async fn execute_build(
     cancelled: Arc<AtomicBool>,
     progress: ProgressSender,
 ) -> Result<PathBuf, String> {
+    // Validate manifest fields before any filesystem or subprocess operations
+    validate::validate_manifest(&request.manifest)?;
+
     let tmpdir = create_build_tmpdir().map_err(|e| format!("Failed to create tmpdir: {e}"))?;
 
     let result = run_pipeline(request, config, &cancelled, &progress, &tmpdir).await;
@@ -89,11 +93,16 @@ async fn run_pipeline(
         binary_path.clone()
     } else if target == BuildTarget::Ios {
         let compiler_app = binary_path.with_extension("app");
-        let inner_binary = compiler_app.join(&request.manifest.app_name);
+        // Use only the filename component of app_name to prevent path traversal
+        // (e.g. app_name = "../../malicious" would escape the .app directory)
+        let safe_name = std::path::Path::new(&request.manifest.app_name)
+            .file_name()
+            .ok_or_else(|| "app_name is not a valid filename".to_string())?;
+        let inner_binary = compiler_app.join(safe_name);
         if inner_binary.exists() {
             let extracted = tmpdir
                 .join("output")
-                .join(format!("{}_ios", request.manifest.app_name));
+                .join(format!("{}_ios", safe_name.to_string_lossy()));
             std::fs::copy(&inner_binary, &extracted)
                 .map_err(|e| format!("Failed to extract iOS binary from compiler .app: {e}"))?;
             extracted
@@ -859,9 +868,37 @@ fn extract_tarball(tarball_path: &std::path::Path, dest: &std::path::Path) -> Re
         std::fs::File::open(tarball_path).map_err(|e| format!("Failed to open tarball: {e}"))?;
     let decoder = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
-    archive
-        .unpack(dest)
-        .map_err(|e| format!("Failed to extract tarball: {e}"))?;
+
+    // Manually iterate entries to prevent path traversal attacks.
+    // archive.unpack() does NOT validate paths — a malicious tarball could
+    // write files outside the destination via ".." components or absolute paths.
+    for entry in archive
+        .entries()
+        .map_err(|e| format!("Failed to read tarball entries: {e}"))?
+    {
+        let mut entry = entry.map_err(|e| format!("Failed to read tarball entry: {e}"))?;
+        let path = entry
+            .path()
+            .map_err(|e| format!("Failed to read entry path: {e}"))?
+            .into_owned();
+
+        // Reject absolute paths and any ".." path components
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "Tarball contains unsafe path (path traversal rejected): {}",
+                path.display()
+            ));
+        }
+
+        entry
+            .unpack_in(dest)
+            .map_err(|e| format!("Failed to extract {}: {e}", path.display()))?;
+    }
+
     Ok(())
 }
 

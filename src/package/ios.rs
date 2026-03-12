@@ -1,3 +1,4 @@
+use crate::build::validate::escape_xml;
 use crate::queue::job::BuildManifest;
 use std::path::Path;
 use tokio::process::Command;
@@ -296,12 +297,12 @@ fn generate_ios_info_plist(manifest: &BuildManifest, sdk_info: Option<&SdkInfo>)
 	<dict/>
 </dict>
 </plist>"#,
-        executable = manifest.app_name,
-        bundle_id = manifest.bundle_id,
-        name = manifest.app_name,
-        version = manifest.version,
-        short_version = short_version,
-        deployment_target = deployment_target,
+        executable = escape_xml(&manifest.app_name),
+        bundle_id = escape_xml(&manifest.bundle_id),
+        name = escape_xml(&manifest.app_name),
+        version = escape_xml(&manifest.version),
+        short_version = escape_xml(short_version),
+        deployment_target = escape_xml(deployment_target),
         device_family_xml = device_family_xml,
         orientation_xml = orientation_xml,
         dt_keys = dt_keys,
@@ -347,9 +348,9 @@ fn resolve_orientations(orientations: &[String]) -> Vec<&'static str> {
 
 fn generate_ios_entitlements(bundle_id: &str, team_id: &str, capabilities: &[String]) -> String {
     let app_id = if team_id.is_empty() {
-        bundle_id.to_string()
+        escape_xml(bundle_id).to_string()
     } else {
-        format!("{team_id}.{bundle_id}")
+        format!("{}.{}", escape_xml(team_id), escape_xml(bundle_id))
     };
     let mut entries = vec![
         // App ID is always included — must be team_id.bundle_id (NOT $(AppIdentifierPrefix)...)
@@ -367,7 +368,7 @@ fn generate_ios_entitlements(bundle_id: &str, team_id: &str, capabilities: &[Str
             }
             other => {
                 // Pass through as a boolean entitlement
-                entries.push(format!("\t<key>{other}</key>\n\t<true/>"));
+                entries.push(format!("\t<key>{}</key>\n\t<true/>", escape_xml(other)));
             }
         }
     }
