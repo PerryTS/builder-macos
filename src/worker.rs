@@ -22,6 +22,7 @@ async fn upload_artifact(
     artifact_name: &str,
     sha256: &str,
     target: &str,
+    auth_token: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     use base64::Engine;
     let data =
@@ -29,12 +30,16 @@ async fn upload_artifact(
     let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
 
     let client = reqwest::Client::new();
-    let resp = client
+    let mut req = client
         .post(url)
         .header("Content-Type", "text/plain")
         .header("x-artifact-name", artifact_name)
         .header("x-artifact-sha256", sha256)
-        .header("x-artifact-target", target)
+        .header("x-artifact-target", target);
+    if let Some(token) = auth_token {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    let resp = req
         .body(b64)
         .send()
         .await
@@ -52,8 +57,14 @@ async fn upload_artifact(
 }
 
 /// Download a base64-encoded tarball from the hub and write the decoded bytes to a temp file.
-async fn download_tarball(url: &str, job_id: &str) -> Result<PathBuf, String> {
-    let resp = reqwest::get(url)
+async fn download_tarball(url: &str, job_id: &str, auth_token: Option<&str>) -> Result<PathBuf, String> {
+    let client = reqwest::Client::new();
+    let mut req = client.get(url);
+    if let Some(token) = auth_token {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    let resp = req
+        .send()
         .await
         .map_err(|e| format!("HTTP request failed: {e}"))?;
 
@@ -92,6 +103,8 @@ pub enum HubMessage {
         tarball_url: String,
         #[serde(default)]
         artifact_upload_url: Option<String>,
+        #[serde(default)]
+        auth_token: Option<String>,
     },
     Cancel {
         job_id: String,
@@ -104,6 +117,8 @@ enum WorkerMessage {
     WorkerHello {
         capabilities: Vec<String>,
         name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        secret: Option<String>,
     },
 }
 
@@ -143,6 +158,7 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
                 .map(|h| h.to_string_lossy().to_string())
                 .unwrap_or_else(|_| "worker".into())
         }),
+        secret: config.hub_secret.clone(),
     };
 
     write
@@ -205,6 +221,7 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
                         credentials,
                         tarball_url,
                         artifact_upload_url,
+                        auth_token,
                     } => {
                         tracing::info!(job_id = %job_id, "Received job assignment");
 
@@ -222,6 +239,7 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
                             credentials,
                             tarball_url,
                             artifact_upload_url,
+                            auth_token,
                         ).await?;
 
                         // Reset heartbeat timer after build completes
@@ -265,6 +283,7 @@ async fn handle_build(
     credentials: serde_json::Value,
     tarball_url: String,
     artifact_upload_url: Option<String>,
+    auth_token: Option<String>,
 ) -> Result<(), String> {
     // Parse manifest and credentials
     let manifest: crate::queue::job::BuildManifest =
@@ -292,7 +311,7 @@ async fn handle_build(
         };
 
     // Download tarball from hub
-    let tarball_path = match download_tarball(&tarball_url, &job_id).await {
+    let tarball_path = match download_tarball(&tarball_url, &job_id, auth_token.as_deref()).await {
         Ok(p) => p,
         Err(e) => {
             let err_msg = format!("Failed to download tarball: {e}");
@@ -425,7 +444,7 @@ async fn handle_build(
             let target = build_target.as_str();
 
             if let Some(ref upload_url) = artifact_upload_url {
-                match upload_artifact(upload_url, &artifact_path, &artifact_name, &sha256, target).await {
+                match upload_artifact(upload_url, &artifact_path, &artifact_name, &sha256, target, auth_token.as_deref()).await {
                     Ok(resp) => {
                         tracing::info!(job_id = %job_id, "Artifact uploaded: {}", resp);
                     }
