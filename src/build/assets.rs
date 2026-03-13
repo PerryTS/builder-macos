@@ -35,6 +35,9 @@ pub fn generate_ios_icons(icon_path: &Path, output_dir: &Path) -> Result<(), Str
         ));
     }
 
+    // Apple rejects iOS icons with alpha channels — convert to opaque RGB
+    let img = DynamicImage::ImageRgb8(img.to_rgb8());
+
     std::fs::create_dir_all(output_dir)
         .map_err(|e| format!("Failed to create icon output dir: {e}"))?;
 
