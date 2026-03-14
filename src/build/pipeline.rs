@@ -537,7 +537,7 @@ async fn run_ios_pipeline(
             .manifest
             .ios_deployment_target
             .as_deref()
-            .unwrap_or("16.0");
+            .unwrap_or("17.0");
         match compile_ios_icon_asset_catalog(&icons_dir, deployment_target, tmpdir).await {
             Ok(assets_car) => {
                 std::fs::copy(&assets_car, app_path.join("Assets.car"))

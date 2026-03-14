@@ -134,7 +134,7 @@ fn generate_ios_info_plist(manifest: &BuildManifest, sdk_info: Option<&SdkInfo>)
     let deployment_target = manifest
         .ios_deployment_target
         .as_deref()
-        .unwrap_or("16.0");
+        .unwrap_or("17.0");
 
     // UIDeviceFamily
     let device_families = resolve_device_families(
