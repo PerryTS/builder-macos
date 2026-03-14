@@ -109,6 +109,7 @@ pub enum HubMessage {
     Cancel {
         job_id: String,
     },
+    UpdatePerry {},
 }
 
 #[derive(Debug, Serialize)]
@@ -119,7 +120,104 @@ enum WorkerMessage {
         name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         secret: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        perry_version: Option<String>,
     },
+    UpdateResult {
+        success: bool,
+        old_version: String,
+        new_version: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+}
+
+/// Get the perry compiler version by running `perry --version`.
+fn get_perry_version(perry_binary: &str) -> Option<String> {
+    std::process::Command::new(perry_binary)
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            // Output is like "perry 0.2.179" — extract version part
+            s.strip_prefix("perry ").map(|v| v.to_string()).or_else(|| {
+                if s.is_empty() { None } else { Some(s) }
+            })
+        })
+}
+
+/// Run the perry update process: git pull + cargo build.
+/// Returns (success, new_version_string, error_message).
+async fn run_perry_update(perry_binary: &str) -> (bool, String, Option<String>) {
+    // Derive source dir from binary path: strip /target/release/perry
+    let src_dir = std::path::Path::new(perry_binary)
+        .parent() // /target/release
+        .and_then(|p| p.parent()) // /target
+        .and_then(|p| p.parent()); // source root
+
+    let src_dir = match src_dir {
+        Some(d) if d.join(".git").exists() => d,
+        _ => {
+            return (false, String::new(), Some("Cannot determine perry source directory from binary path".into()));
+        }
+    };
+
+    tracing::info!(dir = %src_dir.display(), "Updating perry compiler...");
+
+    // git pull
+    let pull = tokio::process::Command::new("git")
+        .arg("pull")
+        .current_dir(src_dir)
+        .output()
+        .await;
+
+    match pull {
+        Ok(ref o) if !o.status.success() => {
+            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+            return (false, String::new(), Some(format!("git pull failed: {stderr}")));
+        }
+        Err(e) => {
+            return (false, String::new(), Some(format!("git pull failed: {e}")));
+        }
+        _ => {}
+    }
+
+    // cargo build --release -p perry -p perry-runtime -p perry-stdlib
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let build = tokio::process::Command::new(&cargo)
+        .args(["build", "--release", "-p", "perry", "-p", "perry-runtime", "-p", "perry-stdlib"])
+        .current_dir(src_dir)
+        .output()
+        .await;
+
+    match build {
+        Ok(ref o) if !o.status.success() => {
+            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+            return (false, String::new(), Some(format!("cargo build failed: {stderr}")));
+        }
+        Err(e) => {
+            return (false, String::new(), Some(format!("cargo build failed: {e}")));
+        }
+        _ => {}
+    }
+
+    // Also build iOS targets for macOS worker
+    let ios_build = tokio::process::Command::new(&cargo)
+        .args(["build", "--release", "-p", "perry-ui-ios", "--target", "aarch64-apple-ios"])
+        .current_dir(src_dir)
+        .output()
+        .await;
+
+    if let Ok(ref o) = ios_build {
+        if !o.status.success() {
+            tracing::warn!("perry-ui-ios build failed (non-fatal): {}", String::from_utf8_lossy(&o.stderr));
+        }
+    }
+
+    let new_version = get_perry_version(perry_binary).unwrap_or_default();
+    tracing::info!(version = %new_version, "Perry update complete");
+    (true, new_version, None)
 }
 
 pub async fn run_worker(config: WorkerConfig) {
@@ -151,6 +249,7 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
     let (mut write, mut read) = ws_stream.split();
 
     // Send worker_hello
+    let perry_version = get_perry_version(&config.perry_binary);
     let hello = WorkerMessage::WorkerHello {
         capabilities: vec!["macos".into(), "ios".into()],
         name: config.worker_name.clone().unwrap_or_else(|| {
@@ -159,6 +258,7 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
                 .unwrap_or_else(|_| "worker".into())
         }),
         secret: config.hub_secret.clone(),
+        perry_version,
     };
 
     write
@@ -248,6 +348,19 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
 
                     HubMessage::Cancel { job_id } => {
                         tracing::info!(job_id = %job_id, "Cancel request (no active build for this job)");
+                    }
+
+                    HubMessage::UpdatePerry {} => {
+                        tracing::info!("Received update_perry request from hub");
+                        let old_version = get_perry_version(&config.perry_binary).unwrap_or_default();
+                        let (success, new_version, error) = run_perry_update(&config.perry_binary).await;
+                        let result = WorkerMessage::UpdateResult {
+                            success,
+                            old_version,
+                            new_version,
+                            error,
+                        };
+                        let _ = write.send(Message::Text(serde_json::to_string(&result).unwrap().into())).await;
                     }
                 }
             }
