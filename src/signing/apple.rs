@@ -42,7 +42,8 @@ impl TempKeychain {
                 .status();
         };
 
-        // 1. Create keychain
+        // 1. Create keychain (delete first in case a stale one exists from a failed build)
+        cleanup(&kc_name);
         let out = std::process::Command::new("security")
             .args(["create-keychain", "-p", &kc_password, &kc_name])
             .output()
