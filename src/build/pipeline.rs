@@ -945,28 +945,16 @@ fn extract_tarball(tarball_path: &std::path::Path, dest: &std::path::Path) -> Re
     Ok(())
 }
 
-/// Query the local Xcode installation for SDK/version info to embed in Info.plist.
-/// Falls back to reasonable defaults if commands fail.
-async fn query_sdk_info() -> ios::SdkInfo {
-    let sdk_version = tokio::process::Command::new("xcrun")
-        .args(["--sdk", "iphoneos", "--show-sdk-version"])
-        .output()
-        .await
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "18.0".to_string());
-
-    let sdk_build = tokio::process::Command::new("xcrun")
-        .args(["--sdk", "iphoneos", "--show-sdk-build-version"])
-        .output()
-        .await
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "22C5048d".to_string());
+/// Query Xcode version info, with env var overrides.
+/// Set PERRY_DT_XCODE, PERRY_DT_XCODE_BUILD to override the Xcode version reported in Info.plist.
+async fn query_xcode_info() -> (String, String) {
+    // Allow env var overrides for when the installed Xcode is behind Apple's requirement
+    if let (Ok(xc), Ok(xcb)) = (
+        std::env::var("PERRY_DT_XCODE"),
+        std::env::var("PERRY_DT_XCODE_BUILD"),
+    ) {
+        return (xc, xcb);
+    }
 
     let xcode_out = tokio::process::Command::new("xcodebuild")
         .arg("-version")
@@ -976,77 +964,80 @@ async fn query_sdk_info() -> ios::SdkInfo {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .unwrap_or_default();
 
-    let mut dt_xcode = "1620".to_string();
-    let mut dt_xcode_build = "16C5032a".to_string();
+    let mut dt_xcode = "26030".to_string();
+    let mut dt_xcode_build = "17C529".to_string();
     for line in xcode_out.lines() {
         if let Some(ver) = line.strip_prefix("Xcode ") {
             let parts: Vec<&str> = ver.trim().split('.').collect();
-            let major: u32 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(16);
+            let major: u32 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(26);
             let minor: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
             dt_xcode = format!("{}{:02}0", major, minor);
         } else if let Some(build) = line.strip_prefix("Build version ") {
             dt_xcode_build = build.trim().to_string();
         }
     }
+
+    (dt_xcode, dt_xcode_build)
+}
+
+/// Query SDK version for a given sdk name (e.g. "iphoneos", "macosx").
+/// Allows override via PERRY_DT_SDK_VERSION and PERRY_DT_SDK_BUILD env vars.
+async fn query_sdk_version(sdk: &str, default_ver: &str, default_build: &str) -> (String, String) {
+    if let (Ok(v), Ok(b)) = (
+        std::env::var("PERRY_DT_SDK_VERSION"),
+        std::env::var("PERRY_DT_SDK_BUILD"),
+    ) {
+        return (v, b);
+    }
+
+    let sdk_version = tokio::process::Command::new("xcrun")
+        .args(["--sdk", sdk, "--show-sdk-version"])
+        .output()
+        .await
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default_ver.to_string());
+
+    let sdk_build = tokio::process::Command::new("xcrun")
+        .args(["--sdk", sdk, "--show-sdk-build-version"])
+        .output()
+        .await
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default_build.to_string());
+
+    (sdk_version, sdk_build)
+}
+
+/// Query the local Xcode installation for iOS SDK/version info to embed in Info.plist.
+async fn query_sdk_info() -> ios::SdkInfo {
+    let (sdk_version, sdk_build) = query_sdk_version("iphoneos", "26.3", "23C53").await;
+    let (xcode, xcode_build) = query_xcode_info().await;
 
     ios::SdkInfo {
         platform_version: sdk_version.clone(),
         sdk_name: format!("iphoneos{sdk_version}"),
         sdk_build,
-        xcode: dt_xcode,
-        xcode_build: dt_xcode_build,
+        xcode,
+        xcode_build,
     }
 }
 
 /// Query the local Xcode installation for macOS SDK info.
 async fn query_macos_sdk_info() -> macos::MacSdkInfo {
-    let sdk_version = tokio::process::Command::new("xcrun")
-        .args(["--sdk", "macosx", "--show-sdk-version"])
-        .output()
-        .await
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "15.0".to_string());
-
-    let sdk_build = tokio::process::Command::new("xcrun")
-        .args(["--sdk", "macosx", "--show-sdk-build-version"])
-        .output()
-        .await
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "24A336".to_string());
-
-    let xcode_out = tokio::process::Command::new("xcodebuild")
-        .arg("-version")
-        .output()
-        .await
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
-
-    let mut dt_xcode = "1620".to_string();
-    let mut dt_xcode_build = "16C5032a".to_string();
-    for line in xcode_out.lines() {
-        if let Some(ver) = line.strip_prefix("Xcode ") {
-            let parts: Vec<&str> = ver.trim().split('.').collect();
-            let major: u32 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(16);
-            let minor: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-            dt_xcode = format!("{}{:02}0", major, minor);
-        } else if let Some(build) = line.strip_prefix("Build version ") {
-            dt_xcode_build = build.trim().to_string();
-        }
-    }
+    let (sdk_version, sdk_build) = query_sdk_version("macosx", "26.3", "25C56").await;
+    let (xcode, xcode_build) = query_xcode_info().await;
 
     macos::MacSdkInfo {
         platform_version: sdk_version.clone(),
         sdk_name: format!("macosx{sdk_version}"),
         sdk_build,
-        xcode: dt_xcode,
-        xcode_build: dt_xcode_build,
+        xcode,
+        xcode_build,
     }
 }
 
