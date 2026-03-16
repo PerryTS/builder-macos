@@ -4,6 +4,7 @@ use crate::build::assets::{
 use crate::build::cleanup::{cleanup_tmpdir, create_build_tmpdir};
 use crate::build::compiler;
 use crate::build::validate;
+use crate::build::verify;
 use crate::config::WorkerConfig;
 use crate::package::{android, ios, macos};
 use crate::publish::{appstore, playstore};
@@ -141,7 +142,7 @@ async fn run_pipeline(
 
 async fn run_macos_pipeline(
     request: &BuildRequest,
-    _config: &WorkerConfig,
+    config: &WorkerConfig,
     cancelled: &Arc<AtomicBool>,
     progress: &ProgressSender,
     tmpdir: &std::path::Path,
@@ -310,6 +311,9 @@ async fn run_macos_pipeline(
         }
         send_progress(progress, StageName::Packaging, 100, None);
 
+        // Verify binary before publishing
+        run_verification(config, progress, cancelled, &dmg_artifact, "macos-arm64", "gui").await?;
+
         // Upload to App Store Connect
         if !has_notarization {
             return Err(
@@ -406,6 +410,9 @@ async fn run_macos_pipeline(
             }
             send_progress(progress, StageName::Packaging, 100, None);
 
+            // Verify binary before publishing
+            run_verification(config, progress, cancelled, &pkg_path, "macos-arm64", "gui").await?;
+
             // Stage 7: Upload to App Store Connect
             let has_creds = request.credentials.apple_key_id.is_some()
                 && request.credentials.apple_issuer_id.is_some()
@@ -464,6 +471,9 @@ async fn run_macos_pipeline(
             }
             send_progress(progress, StageName::Notarizing, 100, None);
 
+            // Verify binary before returning
+            run_verification(config, progress, cancelled, &dmg_path, "macos-arm64", "gui").await?;
+
             let artifact_path = copy_artifact(&dmg_path, &request.manifest.app_name, &request.job_id, "dmg")?;
             Ok(artifact_path)
         }
@@ -472,7 +482,7 @@ async fn run_macos_pipeline(
 
 async fn run_ios_pipeline(
     request: &BuildRequest,
-    _config: &WorkerConfig,
+    config: &WorkerConfig,
     cancelled: &Arc<AtomicBool>,
     progress: &ProgressSender,
     tmpdir: &std::path::Path,
@@ -598,6 +608,9 @@ async fn run_ios_pipeline(
     let ipa_path = tmpdir.join(format!("{}.ipa", request.manifest.app_name));
     ios::create_ipa(&request.manifest.app_name, &app_path, &ipa_path).await?;
     send_progress(progress, StageName::Packaging, 100, None);
+
+    // Verify binary before publishing
+    run_verification(config, progress, cancelled, &ipa_path, "ios-arm64", "gui").await?;
 
     // Stage 7: Upload to App Store Connect (if configured)
     let has_appstore_creds = request.credentials.apple_key_id.is_some()
@@ -762,6 +775,9 @@ async fn run_android_pipeline(
     send_stage(progress, StageName::Packaging, "Finalizing Android package");
     send_progress(progress, StageName::Packaging, 100, None);
 
+    // Verify binary before publishing
+    run_verification(config, progress, cancelled, &final_artifact, "android-arm64", "gui").await?;
+
     // Stage 7: Publishing
     if is_playstore {
         send_stage(progress, StageName::Publishing, "Uploading to Google Play");
@@ -804,6 +820,31 @@ async fn run_android_pipeline(
     let artifact_path =
         copy_artifact(&final_artifact, &request.manifest.app_name, &request.job_id, ext)?;
     Ok(artifact_path)
+}
+
+/// Run verification if a verify URL is configured.
+/// Sends the artifact to perry-verify and blocks until the result is known.
+/// Verification failure aborts the build (prevents publishing broken binaries).
+async fn run_verification(
+    config: &WorkerConfig,
+    progress: &ProgressSender,
+    cancelled: &Arc<AtomicBool>,
+    artifact_path: &std::path::Path,
+    target: &str,
+    app_type: &str,
+) -> Result<(), String> {
+    let verify_url = match config.verify_url.as_deref() {
+        Some(url) => url,
+        None => return Ok(()), // no verify URL configured — skip
+    };
+
+    send_stage(progress, StageName::Verifying, "Verifying binary");
+    check_cancelled(cancelled)?;
+
+    verify::verify_binary(artifact_path, verify_url, target, app_type, progress).await?;
+    send_progress(progress, StageName::Verifying, 100, None);
+
+    Ok(())
 }
 
 /// Copy artifact to a stable location (outside the build tmpdir that gets cleaned up)

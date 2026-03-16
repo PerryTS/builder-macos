@@ -8,6 +8,7 @@ pub struct WorkerConfig {
     pub android_ndk_home: Option<String>,
     pub worker_name: Option<String>,
     pub hub_secret: Option<String>,
+    pub verify_url: Option<String>,
 }
 
 impl WorkerConfig {
@@ -25,6 +26,7 @@ impl WorkerConfig {
                 .ok(),
             worker_name: env::var("PERRY_WORKER_NAME").ok(),
             hub_secret: env::var("PERRY_HUB_WORKER_SECRET").ok(),
+            verify_url: env::var("PERRY_VERIFY_URL").ok(),
         }
     }
 }

@@ -14,6 +14,7 @@ pub enum StageName {
     Notarizing,
     Packaging,
     Uploading,
+    Verifying,
     Publishing,
     Complete,
 }
@@ -30,6 +31,7 @@ impl std::fmt::Display for StageName {
             Self::Notarizing => "notarizing",
             Self::Packaging => "packaging",
             Self::Uploading => "uploading",
+            Self::Verifying => "verifying",
             Self::Publishing => "publishing",
             Self::Complete => "complete",
         };

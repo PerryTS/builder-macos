@@ -3,3 +3,4 @@ pub mod cleanup;
 pub mod compiler;
 pub mod pipeline;
 pub mod validate;
+pub mod verify;
