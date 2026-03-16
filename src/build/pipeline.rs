@@ -153,6 +153,8 @@ async fn run_macos_pipeline(
     let is_appstore = distribute == "appstore" || distribute == "testflight";
     let is_both = distribute == "both";
 
+    let mac_sdk_info = query_macos_sdk_info().await;
+
     // Stage 3: Generate assets (icons)
     send_stage(progress, StageName::GeneratingAssets, "Generating app icons");
     check_cancelled(cancelled)?;
@@ -170,7 +172,7 @@ async fn run_macos_pipeline(
     check_cancelled(cancelled)?;
     let app_path = tmpdir.join(format!("{}.app", request.manifest.app_name));
     let icns_opt = if icns_path.exists() { Some(icns_path.as_path()) } else { None };
-    macos::create_app_bundle(&request.manifest, binary_path, icns_opt, &app_path)?;
+    macos::create_app_bundle(&request.manifest, binary_path, icns_opt, &app_path, Some(&mac_sdk_info))?;
     send_progress(progress, StageName::Bundling, 100, None);
 
     if is_both {
@@ -251,7 +253,7 @@ async fn run_macos_pipeline(
         check_cancelled(cancelled)?;
 
         let app_path_appstore = tmpdir.join(format!("{}-appstore.app", request.manifest.app_name));
-        macos::create_app_bundle(&request.manifest, binary_path, icns_opt, &app_path_appstore)?;
+        macos::create_app_bundle(&request.manifest, binary_path, icns_opt, &app_path_appstore, Some(&mac_sdk_info))?;
 
         let appstore_kc = if let (Some(p12_b64), Some(p12_pass)) = (
             request.credentials.apple_certificate_p12_base64.as_deref(),
@@ -990,6 +992,58 @@ async fn query_sdk_info() -> ios::SdkInfo {
     ios::SdkInfo {
         platform_version: sdk_version.clone(),
         sdk_name: format!("iphoneos{sdk_version}"),
+        sdk_build,
+        xcode: dt_xcode,
+        xcode_build: dt_xcode_build,
+    }
+}
+
+/// Query the local Xcode installation for macOS SDK info.
+async fn query_macos_sdk_info() -> macos::MacSdkInfo {
+    let sdk_version = tokio::process::Command::new("xcrun")
+        .args(["--sdk", "macosx", "--show-sdk-version"])
+        .output()
+        .await
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "15.0".to_string());
+
+    let sdk_build = tokio::process::Command::new("xcrun")
+        .args(["--sdk", "macosx", "--show-sdk-build-version"])
+        .output()
+        .await
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "24A336".to_string());
+
+    let xcode_out = tokio::process::Command::new("xcodebuild")
+        .arg("-version")
+        .output()
+        .await
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+
+    let mut dt_xcode = "1620".to_string();
+    let mut dt_xcode_build = "16C5032a".to_string();
+    for line in xcode_out.lines() {
+        if let Some(ver) = line.strip_prefix("Xcode ") {
+            let parts: Vec<&str> = ver.trim().split('.').collect();
+            let major: u32 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(16);
+            let minor: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            dt_xcode = format!("{}{:02}0", major, minor);
+        } else if let Some(build) = line.strip_prefix("Build version ") {
+            dt_xcode_build = build.trim().to_string();
+        }
+    }
+
+    macos::MacSdkInfo {
+        platform_version: sdk_version.clone(),
+        sdk_name: format!("macosx{sdk_version}"),
         sdk_build,
         xcode: dt_xcode,
         xcode_build: dt_xcode_build,

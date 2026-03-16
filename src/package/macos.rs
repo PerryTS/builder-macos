@@ -3,11 +3,21 @@ use crate::queue::job::BuildManifest;
 use std::path::Path;
 use tokio::process::Command;
 
+/// Xcode/SDK version info for macOS Info.plist DT* keys.
+pub struct MacSdkInfo {
+    pub platform_version: String,
+    pub sdk_name: String,
+    pub sdk_build: String,
+    pub xcode: String,
+    pub xcode_build: String,
+}
+
 pub fn create_app_bundle(
     manifest: &BuildManifest,
     binary_path: &Path,
     icns_path: Option<&Path>,
     app_path: &Path,
+    sdk_info: Option<&MacSdkInfo>,
 ) -> Result<(), String> {
     let contents = app_path.join("Contents");
     let macos_dir = contents.join("MacOS");
@@ -42,7 +52,7 @@ pub fn create_app_bundle(
     };
 
     // Generate Info.plist
-    let info_plist = generate_info_plist(manifest, icon_file_name.as_deref());
+    let info_plist = generate_info_plist(manifest, icon_file_name.as_deref(), sdk_info);
     std::fs::write(contents.join("Info.plist"), info_plist)
         .map_err(|e| format!("Failed to write Info.plist: {e}"))?;
 
@@ -127,7 +137,7 @@ pub async fn create_dmg(app_name: &str, app_path: &Path, dmg_path: &Path) -> Res
     Ok(())
 }
 
-fn generate_info_plist(manifest: &BuildManifest, icon_file: Option<&str>) -> String {
+fn generate_info_plist(manifest: &BuildManifest, icon_file: Option<&str>, sdk_info: Option<&MacSdkInfo>) -> String {
     let short_version = manifest
         .short_version
         .as_deref()
@@ -152,6 +162,24 @@ fn generate_info_plist(manifest: &BuildManifest, icon_file: Option<&str>) -> Str
         })
         .unwrap_or_default();
 
+    let sdk_entries = sdk_info
+        .map(|info| format!(
+            "\t<key>CFBundleSupportedPlatforms</key>\n\t<array>\n\t\t<string>MacOSX</string>\n\t</array>\n\
+             \t<key>DTPlatformName</key>\n\t<string>macosx</string>\n\
+             \t<key>DTPlatformVersion</key>\n\t<string>{platform_version}</string>\n\
+             \t<key>DTSDKName</key>\n\t<string>{sdk_name}</string>\n\
+             \t<key>DTSDKBuild</key>\n\t<string>{sdk_build}</string>\n\
+             \t<key>DTXcode</key>\n\t<string>{xcode}</string>\n\
+             \t<key>DTXcodeBuild</key>\n\t<string>{xcode_build}</string>\n\
+             \t<key>DTCompiler</key>\n\t<string>com.apple.compilers.llvm.clang.1_0</string>\n",
+            platform_version = escape_xml(&info.platform_version),
+            sdk_name = escape_xml(&info.sdk_name),
+            sdk_build = escape_xml(&info.sdk_build),
+            xcode = escape_xml(&info.xcode),
+            xcode_build = escape_xml(&info.xcode_build),
+        ))
+        .unwrap_or_default();
+
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -167,7 +195,7 @@ fn generate_info_plist(manifest: &BuildManifest, icon_file: Option<&str>) -> Str
 	<string>{version}</string>
 	<key>CFBundleShortVersionString</key>
 	<string>{short_version}</string>
-{icon_entry}{encryption_entry}	<key>LSMinimumSystemVersion</key>
+{icon_entry}{encryption_entry}{sdk_entries}	<key>LSMinimumSystemVersion</key>
 	<string>{min_os}</string>
 	<key>LSApplicationCategoryType</key>
 	<string>{category}</string>
