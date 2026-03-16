@@ -46,10 +46,10 @@ pub async fn verify_binary(
     let submit_url = format!("{base_url}/verify");
 
     let form = reqwest::multipart::Form::new()
-        .text("binary_b64", b64)
         .text("target", target.to_string())
         .text("config", config_json)
-        .text("manifest", manifest_json);
+        .text("manifest", manifest_json)
+        .text("binary_b64", b64);
 
     let resp = match client.post(&submit_url).multipart(form).send().await {
         Ok(r) => r,
