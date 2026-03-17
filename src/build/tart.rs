@@ -49,24 +49,29 @@ impl VmSsh {
         Self { ip, password }
     }
 
+    /// Common SSH options to force password auth via sshpass.
+    /// Without these, the host's SSH keys get tried first and exhaust auth attempts.
+    fn ssh_opts() -> Vec<&'static str> {
+        vec![
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "LogLevel=ERROR",
+            "-o", "PreferredAuthentications=password",
+            "-o", "PubkeyAuthentication=no",
+        ]
+    }
+
     /// Run a command inside the VM via SSH. Returns (stdout, stderr).
     async fn exec(&self, remote_cmd: &str) -> Result<(String, String), String> {
+        let user_host = format!("admin@{}", self.ip);
+        let mut args = vec!["-p", &self.password, "ssh"];
+        args.extend(Self::ssh_opts());
+        args.extend(["-o", "ConnectTimeout=10"]);
+        args.push(&user_host);
+        args.push(remote_cmd);
+
         let output = Command::new("sshpass")
-            .args([
-                "-p",
-                &self.password,
-                "ssh",
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
-                "-o",
-                "LogLevel=ERROR",
-                "-o",
-                "ConnectTimeout=10",
-                &format!("admin@{}", self.ip),
-                remote_cmd,
-            ])
+            .args(&args)
             .output()
             .await
             .map_err(|e| format!("SSH exec failed: {e}"))?;
@@ -83,20 +88,15 @@ impl VmSsh {
 
     /// SCP a file to the VM.
     async fn upload(&self, local: &Path, remote: &str) -> Result<(), String> {
+        let mut args = vec!["-p", &self.password, "scp"];
+        args.extend(Self::ssh_opts());
+        let local_str = local.to_string_lossy();
+        args.push(&local_str);
+        let dest = format!("admin@{}:{remote}", self.ip);
+        args.push(&dest);
+
         let output = Command::new("sshpass")
-            .args([
-                "-p",
-                &self.password,
-                "scp",
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
-                "-o",
-                "LogLevel=ERROR",
-                &local.to_string_lossy(),
-                &format!("admin@{}:{remote}", self.ip),
-            ])
+            .args(&args)
             .output()
             .await
             .map_err(|e| format!("SCP upload failed: {e}"))?;
@@ -110,20 +110,15 @@ impl VmSsh {
 
     /// SCP a file from the VM to the host.
     async fn download(&self, remote: &str, local: &Path) -> Result<(), String> {
+        let mut args = vec!["-p", &self.password, "scp"];
+        args.extend(Self::ssh_opts());
+        let src = format!("admin@{}:{remote}", self.ip);
+        args.push(&src);
+        let local_str = local.to_string_lossy();
+        args.push(&local_str);
+
         let output = Command::new("sshpass")
-            .args([
-                "-p",
-                &self.password,
-                "scp",
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
-                "-o",
-                "LogLevel=ERROR",
-                &format!("admin@{}:{remote}", self.ip),
-                &local.to_string_lossy(),
-            ])
+            .args(&args)
             .output()
             .await
             .map_err(|e| format!("SCP download failed: {e}"))?;
@@ -442,18 +437,16 @@ async fn ssh_exec_streaming(
 ) -> Result<String, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
+    let user_host = format!("admin@{}", ssh.ip);
     let mut child = Command::new("sshpass")
         .args([
-            "-p",
-            &ssh.password,
-            "ssh",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            "LogLevel=ERROR",
-            &format!("admin@{}", ssh.ip),
+            "-p", &ssh.password, "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "LogLevel=ERROR",
+            "-o", "PreferredAuthentications=password",
+            "-o", "PubkeyAuthentication=no",
+            &user_host,
             cmd,
         ])
         .stdout(std::process::Stdio::piped())
