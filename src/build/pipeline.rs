@@ -36,6 +36,11 @@ pub async fn execute_build(
     // Validate manifest fields before any filesystem or subprocess operations
     validate::validate_manifest(&request.manifest)?;
 
+    // If Tart VM isolation is enabled, delegate the entire build to a fresh VM
+    if config.tart_enabled() {
+        return super::tart::execute_build_in_vm(request, config, cancelled, progress).await;
+    }
+
     let tmpdir = create_build_tmpdir().map_err(|e| format!("Failed to create tmpdir: {e}"))?;
 
     let result = run_pipeline(request, config, &cancelled, &progress, &tmpdir).await;
