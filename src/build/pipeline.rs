@@ -981,15 +981,7 @@ async fn query_xcode_info() -> (String, String) {
 }
 
 /// Query SDK version for a given sdk name (e.g. "iphoneos", "macosx").
-/// Allows override via PERRY_DT_SDK_VERSION and PERRY_DT_SDK_BUILD env vars.
 async fn query_sdk_version(sdk: &str, default_ver: &str, default_build: &str) -> (String, String) {
-    if let (Ok(v), Ok(b)) = (
-        std::env::var("PERRY_DT_SDK_VERSION"),
-        std::env::var("PERRY_DT_SDK_BUILD"),
-    ) {
-        return (v, b);
-    }
-
     let sdk_version = tokio::process::Command::new("xcrun")
         .args(["--sdk", sdk, "--show-sdk-version"])
         .output()
@@ -1014,9 +1006,17 @@ async fn query_sdk_version(sdk: &str, default_ver: &str, default_build: &str) ->
 }
 
 /// Query the local Xcode installation for iOS SDK/version info to embed in Info.plist.
+/// When PERRY_DT_XCODE is set (override mode), uses consistent Xcode 26.3 SDK values
+/// instead of querying the local (potentially outdated) Xcode.
 async fn query_sdk_info() -> ios::SdkInfo {
-    let (sdk_version, sdk_build) = query_sdk_version("iphoneos", "26.3", "23C53").await;
     let (xcode, xcode_build) = query_xcode_info().await;
+
+    // If we're overriding Xcode version, also override SDK to stay consistent
+    let (sdk_version, sdk_build) = if std::env::var("PERRY_DT_XCODE").is_ok() {
+        ("26.3".to_string(), "23D8133".to_string())
+    } else {
+        query_sdk_version("iphoneos", "26.3", "23D8133").await
+    };
 
     ios::SdkInfo {
         platform_version: sdk_version.clone(),
@@ -1028,9 +1028,15 @@ async fn query_sdk_info() -> ios::SdkInfo {
 }
 
 /// Query the local Xcode installation for macOS SDK info.
+/// When PERRY_DT_XCODE is set (override mode), uses consistent Xcode 26.3 SDK values.
 async fn query_macos_sdk_info() -> macos::MacSdkInfo {
-    let (sdk_version, sdk_build) = query_sdk_version("macosx", "26.3", "25C56").await;
     let (xcode, xcode_build) = query_xcode_info().await;
+
+    let (sdk_version, sdk_build) = if std::env::var("PERRY_DT_XCODE").is_ok() {
+        ("26.3".to_string(), "25D2140".to_string())
+    } else {
+        query_sdk_version("macosx", "26.3", "25D2140").await
+    };
 
     macos::MacSdkInfo {
         platform_version: sdk_version.clone(),
