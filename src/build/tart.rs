@@ -365,8 +365,10 @@ async fn run_vm_build(
     let remote_artifact_dir = "/tmp/perry-artifacts";
 
     // Build command: run perry-ship in single-job mode inside the VM
+    // Source cargo env to ensure Rust tools are available for native lib builds
     let build_cmd = format!(
-        "mkdir -p {remote_artifact_dir} && \
+        "source ~/.cargo/env 2>/dev/null; \
+         mkdir -p {remote_artifact_dir} && \
          {perry_ship_path} build-local \
          --manifest /tmp/manifest.json \
          --credentials /tmp/credentials.json \
