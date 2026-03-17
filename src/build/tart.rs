@@ -456,6 +456,7 @@ async fn ssh_exec_streaming(
     let mut stderr_reader = BufReader::new(stderr).lines();
 
     let mut full_stdout = String::new();
+    let mut full_stderr = String::new();
 
     loop {
         if cancelled.load(Ordering::Relaxed) {
@@ -491,6 +492,8 @@ async fn ssh_exec_streaming(
                 match line {
                     Ok(Some(l)) => {
                         send_log(progress, StageName::Compiling, &l, LogStream::Stderr);
+                        full_stderr.push_str(&l);
+                        full_stderr.push('\n');
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -501,13 +504,38 @@ async fn ssh_exec_streaming(
         }
     }
 
+    // Drain remaining stderr after stdout closes
+    while let Ok(Some(l)) = stderr_reader.next_line().await {
+        send_log(progress, StageName::Compiling, &l, LogStream::Stderr);
+        full_stderr.push_str(&l);
+        full_stderr.push('\n');
+    }
+
     let status = child
         .wait()
         .await
         .map_err(|e| format!("Failed to wait for SSH process: {e}"))?;
 
     if !status.success() {
-        return Err(format!("Build exited with {status}"));
+        // Extract BUILD_ERROR from stderr if present
+        let build_error = full_stderr
+            .lines()
+            .find(|l| l.starts_with("BUILD_ERROR:"))
+            .map(|l| l.strip_prefix("BUILD_ERROR:").unwrap().trim().to_string());
+        let err_msg = build_error.unwrap_or_else(|| {
+            if full_stderr.trim().is_empty() {
+                format!("Build exited with {status}")
+            } else {
+                // Use last non-empty line of stderr
+                full_stderr
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("unknown error")
+                    .to_string()
+            }
+        });
+        return Err(err_msg);
     }
 
     Ok(full_stdout)
