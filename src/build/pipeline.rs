@@ -1011,16 +1011,18 @@ async fn query_sdk_version(sdk: &str, default_ver: &str, default_build: &str) ->
 }
 
 /// Query the local Xcode installation for iOS SDK/version info to embed in Info.plist.
-/// When PERRY_DT_XCODE is set (override mode), uses consistent Xcode 26.3 SDK values
-/// instead of querying the local (potentially outdated) Xcode.
+/// When PERRY_DT_XCODE is set (override mode), uses the SDK values that ship with
+/// Xcode 26.3 GM instead of querying the local (potentially outdated) Xcode.
+/// Note: Xcode 26.3 ships with iOS SDK 26.2, not 26.3.
 async fn query_sdk_info() -> ios::SdkInfo {
     let (xcode, xcode_build) = query_xcode_info().await;
 
-    // If we're overriding Xcode version, also override SDK to stay consistent
+    // If we're overriding Xcode version, also override SDK to stay consistent.
+    // Xcode 26.3 (17C529) ships with iOS SDK 26.2 (build 23C57).
     let (sdk_version, sdk_build) = if std::env::var("PERRY_DT_XCODE").is_ok() {
-        ("26.3".to_string(), "23D125".to_string())
+        ("26.2".to_string(), "23C57".to_string())
     } else {
-        query_sdk_version("iphoneos", "26.3", "23D125").await
+        query_sdk_version("iphoneos", "26.2", "23C57").await
     };
 
     ios::SdkInfo {
@@ -1033,14 +1035,16 @@ async fn query_sdk_info() -> ios::SdkInfo {
 }
 
 /// Query the local Xcode installation for macOS SDK info.
-/// When PERRY_DT_XCODE is set (override mode), uses consistent Xcode 26.3 SDK values.
+/// When PERRY_DT_XCODE is set (override mode), uses the SDK values that ship with
+/// Xcode 26.3 GM. Note: Xcode 26.3 ships with macOS SDK 26.2, not 26.3.
 async fn query_macos_sdk_info() -> macos::MacSdkInfo {
     let (xcode, xcode_build) = query_xcode_info().await;
 
+    // Xcode 26.3 (17C529) ships with macOS SDK 26.2 (build 25C58).
     let (sdk_version, sdk_build) = if std::env::var("PERRY_DT_XCODE").is_ok() {
-        ("26.3".to_string(), "25D125".to_string())
+        ("26.2".to_string(), "25C58".to_string())
     } else {
-        query_sdk_version("macosx", "26.3", "25D125").await
+        query_sdk_version("macosx", "26.2", "25C58").await
     };
 
     macos::MacSdkInfo {
