@@ -293,6 +293,8 @@ fn generate_ios_info_plist(manifest: &BuildManifest, sdk_info: Option<&SdkInfo>)
 			</array>
 		</dict>
 	</dict>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	{encryption_value}
 	<key>UILaunchScreen</key>
 	<dict/>
 </dict>
@@ -307,6 +309,7 @@ fn generate_ios_info_plist(manifest: &BuildManifest, sdk_info: Option<&SdkInfo>)
         orientation_xml = orientation_xml,
         dt_keys = dt_keys,
         ipad_orientation_xml = ipad_orientation_xml,
+        encryption_value = if manifest.ios_encryption_exempt.unwrap_or(true) { "<false/>" } else { "<true/>" },
     )
 }
 

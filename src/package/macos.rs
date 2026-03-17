@@ -155,12 +155,11 @@ fn generate_info_plist(manifest: &BuildManifest, icon_file: Option<&str>, sdk_in
         .map(|f| format!("\t<key>CFBundleIconFile</key>\n\t<string>{}</string>\n", escape_xml(f)))
         .unwrap_or_default();
 
-    let encryption_entry = manifest.macos_encryption_exempt
-        .map(|exempt| {
-            let value = if exempt { "<false/>" } else { "<true/>" };
-            format!("\t<key>ITSAppUsesNonExemptEncryption</key>\n\t{value}\n")
-        })
-        .unwrap_or_default();
+    let uses_non_exempt = !manifest.macos_encryption_exempt.unwrap_or(true);
+    let encryption_entry = format!(
+        "\t<key>ITSAppUsesNonExemptEncryption</key>\n\t{}\n",
+        if uses_non_exempt { "<true/>" } else { "<false/>" }
+    );
 
     let sdk_entries = sdk_info
         .map(|info| format!(
