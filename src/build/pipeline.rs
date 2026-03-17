@@ -969,14 +969,16 @@ async fn query_xcode_info() -> (String, String) {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .unwrap_or_default();
 
-    let mut dt_xcode = "26030".to_string();
+    let mut dt_xcode = "2630".to_string();
     let mut dt_xcode_build = "17C529".to_string();
     for line in xcode_out.lines() {
         if let Some(ver) = line.strip_prefix("Xcode ") {
             let parts: Vec<&str> = ver.trim().split('.').collect();
             let major: u32 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(26);
             let minor: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-            dt_xcode = format!("{}{:02}0", major, minor);
+            // DTXcode is a 4-digit code: MMmP (major 2 digits, minor 1, patch 1)
+            // e.g. Xcode 16.2 → 1620, Xcode 26.3 → 2630
+            dt_xcode = format!("{:02}{}{}", major, minor, 0);
         } else if let Some(build) = line.strip_prefix("Build version ") {
             dt_xcode_build = build.trim().to_string();
         }
