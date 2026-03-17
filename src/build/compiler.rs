@@ -139,6 +139,10 @@ fn setup_target_symlink(perry_binary: &str, project_dir: &Path) -> Result<(), St
         perry_path.to_path_buf()
     };
 
+    // Resolve symlinks so we find the real target/ directory
+    // (e.g. ~/bin/perry → ~/perry/target/release/perry)
+    let perry_path = perry_path.canonicalize().unwrap_or(perry_path);
+
     if let Some(bin_dir) = perry_path.parent() {
         if let Some(target_dir) = bin_dir.parent() {
             let link_path = project_dir.join("target");
