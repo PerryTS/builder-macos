@@ -366,8 +366,15 @@ async fn run_vm_build(
 
     // Build command: run perry-ship in single-job mode inside the VM
     // Source cargo env to ensure Rust tools are available for native lib builds
+    // Propagate DT override env vars so Info.plist gets correct Xcode/SDK versions
+    let mut env_exports = String::new();
+    for var in ["PERRY_DT_XCODE", "PERRY_DT_XCODE_BUILD", "PERRY_VERIFY_URL"] {
+        if let Ok(val) = std::env::var(var) {
+            env_exports.push_str(&format!("export {var}='{val}'; "));
+        }
+    }
     let build_cmd = format!(
-        "source ~/.cargo/env 2>/dev/null; \
+        "source ~/.cargo/env 2>/dev/null; {env_exports}\
          mkdir -p {remote_artifact_dir} && \
          {perry_ship_path} build-local \
          --manifest /tmp/manifest.json \
