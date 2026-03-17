@@ -1018,9 +1018,9 @@ async fn query_sdk_info() -> ios::SdkInfo {
 
     // If we're overriding Xcode version, also override SDK to stay consistent
     let (sdk_version, sdk_build) = if std::env::var("PERRY_DT_XCODE").is_ok() {
-        ("26.3".to_string(), "23D8133".to_string())
+        ("26.3".to_string(), "23D125".to_string())
     } else {
-        query_sdk_version("iphoneos", "26.3", "23D8133").await
+        query_sdk_version("iphoneos", "26.3", "23D125").await
     };
 
     ios::SdkInfo {
@@ -1038,9 +1038,9 @@ async fn query_macos_sdk_info() -> macos::MacSdkInfo {
     let (xcode, xcode_build) = query_xcode_info().await;
 
     let (sdk_version, sdk_build) = if std::env::var("PERRY_DT_XCODE").is_ok() {
-        ("26.3".to_string(), "25D2140".to_string())
+        ("26.3".to_string(), "25D125".to_string())
     } else {
-        query_sdk_version("macosx", "26.3", "25D2140").await
+        query_sdk_version("macosx", "26.3", "25D125").await
     };
 
     macos::MacSdkInfo {
