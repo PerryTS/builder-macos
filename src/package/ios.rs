@@ -184,6 +184,8 @@ fn generate_ios_info_plist(manifest: &BuildManifest, sdk_info: Option<&SdkInfo>)
 	<string>iphoneos</string>
 	<key>DTPlatformVersion</key>
 	<string>{platform_version}</string>
+	<key>DTPlatformBuild</key>
+	<string>{sdk_build}</string>
 	<key>DTSDKName</key>
 	<string>{sdk_name}</string>
 	<key>DTSDKBuild</key>
@@ -193,7 +195,9 @@ fn generate_ios_info_plist(manifest: &BuildManifest, sdk_info: Option<&SdkInfo>)
 	<key>DTXcodeBuild</key>
 	<string>{xcode_build}</string>
 	<key>DTCompiler</key>
-	<string>com.apple.compilers.llvm.clang.1_0</string>"#,
+	<string>com.apple.compilers.llvm.clang.1_0</string>
+	<key>BuildMachineOSBuild</key>
+	<string>{xcode_build}</string>"#,
             platform_version = info.platform_version,
             sdk_name = info.sdk_name,
             sdk_build = info.sdk_build,

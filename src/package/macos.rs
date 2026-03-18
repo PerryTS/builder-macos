@@ -166,11 +166,13 @@ fn generate_info_plist(manifest: &BuildManifest, icon_file: Option<&str>, sdk_in
             "\t<key>CFBundleSupportedPlatforms</key>\n\t<array>\n\t\t<string>MacOSX</string>\n\t</array>\n\
              \t<key>DTPlatformName</key>\n\t<string>macosx</string>\n\
              \t<key>DTPlatformVersion</key>\n\t<string>{platform_version}</string>\n\
+             \t<key>DTPlatformBuild</key>\n\t<string>{sdk_build}</string>\n\
              \t<key>DTSDKName</key>\n\t<string>{sdk_name}</string>\n\
              \t<key>DTSDKBuild</key>\n\t<string>{sdk_build}</string>\n\
              \t<key>DTXcode</key>\n\t<string>{xcode}</string>\n\
              \t<key>DTXcodeBuild</key>\n\t<string>{xcode_build}</string>\n\
-             \t<key>DTCompiler</key>\n\t<string>com.apple.compilers.llvm.clang.1_0</string>\n",
+             \t<key>DTCompiler</key>\n\t<string>com.apple.compilers.llvm.clang.1_0</string>\n\
+             \t<key>BuildMachineOSBuild</key>\n\t<string>{xcode_build}</string>\n",
             platform_version = escape_xml(&info.platform_version),
             sdk_name = escape_xml(&info.sdk_name),
             sdk_build = escape_xml(&info.sdk_build),
