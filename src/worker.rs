@@ -201,8 +201,8 @@ async fn run_perry_update(perry_binary: &str) -> (bool, String, Option<String>) 
     );
 
     // Run the update script inside the VM
-    // Use install instead of cp to handle same-file cases (hardlinks/symlinks).
     // Build each target separately to keep memory usage reasonable.
+    // Use cp to temp + mv to handle hardlinked same-file cases.
     let update_script = concat!(
         "set -e; cd ~/perry; git pull; ",
         "cargo build --release -p perry; ",
@@ -211,13 +211,13 @@ async fn run_perry_update(perry_binary: &str) -> (bool, String, Option<String>) 
         "cargo build --release -p perry-ui-ios --target aarch64-apple-ios; ",
         "cargo build --release -p perry-runtime --target aarch64-apple-ios; ",
         "cargo build --release -p perry-stdlib --target aarch64-apple-ios; ",
-        "install -m 755 target/release/perry ~/bin/perry; ",
-        "install -m 644 target/release/libperry_runtime.a ~/bin/; ",
-        "install -m 644 target/release/libperry_stdlib.a ~/bin/; ",
-        "install -m 644 target/release/libperry_ui_macos.a ~/bin/; ",
-        "install -m 644 target/aarch64-apple-ios/release/libperry_runtime.a ~/bin/libperry_runtime_ios.a; ",
-        "install -m 644 target/aarch64-apple-ios/release/libperry_stdlib.a ~/bin/libperry_stdlib_ios.a; ",
-        "install -m 644 target/aarch64-apple-ios/release/libperry_ui_ios.a ~/bin/libperry_ui_ios.a; ",
+        "cp target/release/perry ~/bin/perry.tmp && mv -f ~/bin/perry.tmp ~/bin/perry; ",
+        "cp target/release/libperry_runtime.a ~/bin/libperry_runtime.a.tmp && mv -f ~/bin/libperry_runtime.a.tmp ~/bin/libperry_runtime.a; ",
+        "cp target/release/libperry_stdlib.a ~/bin/libperry_stdlib.a.tmp && mv -f ~/bin/libperry_stdlib.a.tmp ~/bin/libperry_stdlib.a; ",
+        "cp target/release/libperry_ui_macos.a ~/bin/libperry_ui_macos.a.tmp && mv -f ~/bin/libperry_ui_macos.a.tmp ~/bin/libperry_ui_macos.a; ",
+        "cp target/aarch64-apple-ios/release/libperry_runtime.a ~/bin/libperry_runtime_ios.a.tmp && mv -f ~/bin/libperry_runtime_ios.a.tmp ~/bin/libperry_runtime_ios.a; ",
+        "cp target/aarch64-apple-ios/release/libperry_stdlib.a ~/bin/libperry_stdlib_ios.a.tmp && mv -f ~/bin/libperry_stdlib_ios.a.tmp ~/bin/libperry_stdlib_ios.a; ",
+        "cp target/aarch64-apple-ios/release/libperry_ui_ios.a ~/bin/libperry_ui_ios.a.tmp && mv -f ~/bin/libperry_ui_ios.a.tmp ~/bin/libperry_ui_ios.a; ",
         "~/bin/perry --version"
     );
 
@@ -372,6 +372,9 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
     ping_interval.tick().await; // consume the immediate first tick
     let mut last_message_at = tokio::time::Instant::now();
 
+    // Channel for background update results
+    let (update_tx, mut update_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerMessage>();
+
     loop {
         tokio::select! {
             biased;
@@ -449,15 +452,28 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
                     HubMessage::UpdatePerry {} => {
                         tracing::info!("Received update_perry request from hub");
                         let old_version = get_perry_version(&config.perry_binary).unwrap_or_default();
-                        let (success, new_version, error) = run_perry_update(&config.perry_binary).await;
-                        let result = WorkerMessage::UpdateResult {
-                            success,
-                            old_version,
-                            new_version,
-                            error,
-                        };
-                        let _ = write.send(Message::Text(serde_json::to_string(&result).unwrap().into())).await;
+                        // Spawn update in background so the main loop continues
+                        // processing pings and hub messages during the long build.
+                        let perry_bin = config.perry_binary.clone();
+                        let update_result_tx = update_tx.clone();
+                        tokio::spawn(async move {
+                            let (success, new_version, error) = run_perry_update(&perry_bin).await;
+                            let result = WorkerMessage::UpdateResult {
+                                success,
+                                old_version,
+                                new_version,
+                                error,
+                            };
+                            let _ = update_result_tx.send(result);
+                        });
                     }
+                }
+            }
+
+            // Handle background update results
+            result = update_rx.recv() => {
+                if let Some(result) = result {
+                    let _ = write.send(Message::Text(serde_json::to_string(&result).unwrap().into())).await;
                 }
             }
 
