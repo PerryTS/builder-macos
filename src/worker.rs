@@ -151,6 +151,18 @@ fn get_perry_version(perry_binary: &str) -> Option<String> {
 /// Boots the golden image, SSHes in, pulls + rebuilds, copies libs, then saves.
 /// Returns (success, new_version_string, error_message).
 async fn run_perry_update(perry_binary: &str) -> (bool, String, Option<String>) {
+    // Prevent concurrent updates — use a simple file lock
+    let lock_path = std::env::temp_dir().join("perry-update.lock");
+    if lock_path.exists() {
+        tracing::info!("Update already in progress (lock file exists), skipping");
+        return (false, String::new(), Some("Update already in progress".into()));
+    }
+    let _ = std::fs::write(&lock_path, "");
+    // Ensure lock is removed on exit
+    struct LockGuard(std::path::PathBuf);
+    impl Drop for LockGuard { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
+    let _lock = LockGuard(lock_path);
+
     let golden_image = std::env::var("PERRY_TART_IMAGE")
         .unwrap_or_else(|_| "perry-builder-golden".into());
     let ssh_password = std::env::var("PERRY_TART_SSH_PASSWORD")
