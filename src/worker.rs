@@ -132,19 +132,30 @@ enum WorkerMessage {
     },
 }
 
-/// Get the perry compiler version by running `perry --version`.
+/// Get the perry compiler version.
+/// First tries running the binary directly; if that fails (e.g. the binary is
+/// inside a Tart VM), reads from ~/.perry-version which is written after each update.
 fn get_perry_version(perry_binary: &str) -> Option<String> {
-    std::process::Command::new(perry_binary)
+    // Try running the binary directly (works for Linux/Windows workers)
+    if let Some(v) = std::process::Command::new(perry_binary)
         .arg("--version")
         .output()
         .ok()
         .and_then(|o| {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            // Output is like "perry 0.2.179" — extract version part
             s.strip_prefix("perry ").map(|v| v.to_string()).or_else(|| {
                 if s.is_empty() { None } else { Some(s) }
             })
         })
+    {
+        return Some(v);
+    }
+
+    // Fallback: read cached version file (written by golden VM update)
+    let version_file = std::env::var("HOME")
+        .map(|h| format!("{h}/.perry-version"))
+        .unwrap_or_else(|_| "/tmp/.perry-version".into());
+    std::fs::read_to_string(version_file).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// Run the perry update process by updating the golden Tart VM image.
@@ -309,6 +320,12 @@ async fn run_perry_update(perry_binary: &str) -> (bool, String, Option<String>) 
     // Step 4: Cleanup
     let _ = run_tart_cmd(&["delete", update_vm]).await;
     let _ = run_tart_cmd(&["delete", &backup_name]).await;
+
+    // Cache version on host so get_perry_version works without booting the VM
+    let version_file = std::env::var("HOME")
+        .map(|h| format!("{h}/.perry-version"))
+        .unwrap_or_else(|_| "/tmp/.perry-version".into());
+    let _ = std::fs::write(&version_file, &new_version);
 
     tracing::info!(version = %new_version, "Golden image updated successfully");
     (true, new_version, None)
