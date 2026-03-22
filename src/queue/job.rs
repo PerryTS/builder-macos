@@ -29,6 +29,9 @@ pub struct BuildManifest {
     pub ios_distribute: Option<String>,
     #[serde(default)]
     pub ios_encryption_exempt: Option<bool>,
+    /// Custom Info.plist entries (e.g. NSMicrophoneUsageDescription)
+    #[serde(default)]
+    pub ios_info_plist: Option<std::collections::HashMap<String, String>>,
     // macOS-specific fields
     #[serde(default)]
     pub macos_distribute: Option<String>,

@@ -301,6 +301,11 @@ fn generate_ios_info_plist(manifest: &BuildManifest, sdk_info: Option<&SdkInfo>)
 	{encryption_value}
 	<key>UILaunchScreen</key>
 	<dict/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>This app uses the microphone to measure sound levels.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>This app uses the camera to identify colors.</string>
+{custom_info_plist}
 </dict>
 </plist>"#,
         executable = escape_xml(&manifest.app_name),
@@ -314,6 +319,18 @@ fn generate_ios_info_plist(manifest: &BuildManifest, sdk_info: Option<&SdkInfo>)
         dt_keys = dt_keys,
         ipad_orientation_xml = ipad_orientation_xml,
         encryption_value = if manifest.ios_encryption_exempt.unwrap_or(true) { "<false/>" } else { "<true/>" },
+        custom_info_plist = {
+            // Inject custom Info.plist entries from [ios.info_plist] in perry.toml.
+            // These override the hardcoded defaults above if keys match.
+            let mut entries = String::new();
+            if let Some(ref map) = manifest.ios_info_plist {
+                for (key, value) in map {
+                    entries.push_str(&format!("\t<key>{}</key>\n\t<string>{}</string>\n",
+                        escape_xml(key), escape_xml(value)));
+                }
+            }
+            entries
+        },
     )
 }
 
