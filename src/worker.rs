@@ -201,21 +201,23 @@ async fn run_perry_update(perry_binary: &str) -> (bool, String, Option<String>) 
     );
 
     // Run the update script inside the VM
+    // Use install instead of cp to handle same-file cases (hardlinks/symlinks).
+    // Build each target separately to keep memory usage reasonable.
     let update_script = concat!(
-        "cd ~/perry && git pull && ",
-        "cargo build --release -p perry && ",
-        "cargo build --release -p perry-runtime -p perry-stdlib && ",
-        "cargo build --release -p perry-ui-macos && ",
-        "cargo build --release -p perry-ui-ios --target aarch64-apple-ios && ",
-        "cargo build --release -p perry-runtime --target aarch64-apple-ios && ",
-        "cargo build --release -p perry-stdlib --target aarch64-apple-ios && ",
-        "cp target/release/perry ~/bin/ && ",
-        "cp target/release/libperry_runtime.a ~/bin/ && ",
-        "cp target/release/libperry_stdlib.a ~/bin/ && ",
-        "cp target/release/libperry_ui_macos.a ~/bin/ && ",
-        "cp target/aarch64-apple-ios/release/libperry_runtime.a ~/bin/libperry_runtime_ios.a && ",
-        "cp target/aarch64-apple-ios/release/libperry_stdlib.a ~/bin/libperry_stdlib_ios.a && ",
-        "cp target/aarch64-apple-ios/release/libperry_ui_ios.a ~/bin/libperry_ui_ios.a && ",
+        "set -e; cd ~/perry; git pull; ",
+        "cargo build --release -p perry; ",
+        "cargo build --release -p perry-runtime -p perry-stdlib; ",
+        "cargo build --release -p perry-ui-macos; ",
+        "cargo build --release -p perry-ui-ios --target aarch64-apple-ios; ",
+        "cargo build --release -p perry-runtime --target aarch64-apple-ios; ",
+        "cargo build --release -p perry-stdlib --target aarch64-apple-ios; ",
+        "install -m 755 target/release/perry ~/bin/perry; ",
+        "install -m 644 target/release/libperry_runtime.a ~/bin/; ",
+        "install -m 644 target/release/libperry_stdlib.a ~/bin/; ",
+        "install -m 644 target/release/libperry_ui_macos.a ~/bin/; ",
+        "install -m 644 target/aarch64-apple-ios/release/libperry_runtime.a ~/bin/libperry_runtime_ios.a; ",
+        "install -m 644 target/aarch64-apple-ios/release/libperry_stdlib.a ~/bin/libperry_stdlib_ios.a; ",
+        "install -m 644 target/aarch64-apple-ios/release/libperry_ui_ios.a ~/bin/libperry_ui_ios.a; ",
         "~/bin/perry --version"
     );
 
