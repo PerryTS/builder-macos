@@ -280,19 +280,35 @@ async fn run_perry_update(perry_binary: &str) -> (bool, String, Option<String>) 
     let _ = run_tart_cmd(&["stop", update_vm]).await;
     let _ = vm_child.kill().await;
 
-    // Replace golden image with the updated VM
+    // Replace golden image with the updated VM — SAFE: backup first, restore on failure
     tracing::info!("Replacing golden image with updated VM...");
+    let backup_name = format!("{golden_image}-backup");
+    // Step 1: Backup golden → golden-backup
+    let _ = run_tart_cmd(&["delete", &backup_name]).await; // remove stale backup
+    if let Err(e) = run_tart_cmd(&["clone", &golden_image, &backup_name]).await {
+        tracing::warn!("Failed to backup golden image (continuing anyway): {e}");
+    }
+    // Step 2: Delete golden
     if let Err(e) = run_tart_cmd(&["delete", &golden_image]).await {
         tracing::error!("Failed to delete old golden image: {e}");
         let _ = run_tart_cmd(&["delete", update_vm]).await;
+        let _ = run_tart_cmd(&["delete", &backup_name]).await;
         return (false, new_version.clone(), Some(format!("Failed to replace golden image: {e}")));
     }
+    // Step 3: Clone update → golden
     if let Err(e) = run_tart_cmd(&["clone", update_vm, &golden_image]).await {
-        tracing::error!("Failed to clone update VM to golden: {e}");
-        // Critical: golden image is deleted but clone failed!
-        return (false, new_version.clone(), Some(format!("CRITICAL: golden image deleted but clone failed: {e}")));
+        tracing::error!("Clone failed, restoring from backup: {e}");
+        // Restore golden from backup
+        if let Err(e2) = run_tart_cmd(&["clone", &backup_name, &golden_image]).await {
+            tracing::error!("CRITICAL: restore from backup also failed: {e2}");
+        }
+        let _ = run_tart_cmd(&["delete", update_vm]).await;
+        let _ = run_tart_cmd(&["delete", &backup_name]).await;
+        return (false, new_version.clone(), Some(format!("Failed to replace golden image: {e}")));
     }
+    // Step 4: Cleanup
     let _ = run_tart_cmd(&["delete", update_vm]).await;
+    let _ = run_tart_cmd(&["delete", &backup_name]).await;
 
     tracing::info!(version = %new_version, "Golden image updated successfully");
     (true, new_version, None)
