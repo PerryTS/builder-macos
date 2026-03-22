@@ -204,7 +204,7 @@ async fn run_perry_update(perry_binary: &str) -> (bool, String, Option<String>) 
     // Build each target separately to keep memory usage reasonable.
     // Use cp to temp + mv to handle hardlinked same-file cases.
     let update_script = concat!(
-        "set -e; cd ~/perry; rm -f .git/index.lock; rm -rf .git/refs/remotes/origin; git fetch origin; git checkout -B main origin/main; ",
+        "set -e; cd ~/perry; rm -f .git/index.lock; git fetch origin --force --prune; git checkout -B main origin/main; ",
         "cargo build --release -p perry; ",
         "cargo build --release -p perry-runtime -p perry-stdlib; ",
         "cargo build --release -p perry-ui-macos; ",
