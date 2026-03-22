@@ -147,77 +147,171 @@ fn get_perry_version(perry_binary: &str) -> Option<String> {
         })
 }
 
-/// Run the perry update process: git pull + cargo build.
+/// Run the perry update process by updating the golden Tart VM image.
+/// Boots the golden image, SSHes in, pulls + rebuilds, copies libs, then saves.
 /// Returns (success, new_version_string, error_message).
 async fn run_perry_update(perry_binary: &str) -> (bool, String, Option<String>) {
-    // Derive source dir from binary path: strip /target/release/perry
-    let src_dir = std::path::Path::new(perry_binary)
-        .parent() // /target/release
-        .and_then(|p| p.parent()) // /target
-        .and_then(|p| p.parent()); // source root
+    let golden_image = std::env::var("PERRY_TART_IMAGE")
+        .unwrap_or_else(|_| "perry-builder-golden".into());
+    let ssh_password = std::env::var("PERRY_TART_SSH_PASSWORD")
+        .unwrap_or_else(|_| "admin".into());
+    let sshpass = std::env::var("HOME")
+        .map(|h| format!("{h}/bin/sshpass"))
+        .unwrap_or_else(|_| "sshpass".into());
 
-    let src_dir = match src_dir {
-        Some(d) if d.join(".git").exists() => d,
-        _ => {
-            return (false, String::new(), Some("Cannot determine perry source directory from binary path".into()));
+    tracing::info!(image = %golden_image, "Updating perry in golden Tart VM...");
+
+    // Clone golden image to a temporary update VM
+    let update_vm = "perry-update-tmp";
+    let clone = run_tart_cmd(&["clone", &golden_image, update_vm]).await;
+    if let Err(e) = clone {
+        return (false, String::new(), Some(format!("Failed to clone golden image: {e}")));
+    }
+
+    // Boot the update VM
+    let mut vm_child = match tokio::process::Command::new("tart")
+        .args(["run", update_vm, "--no-graphics"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = run_tart_cmd(&["delete", update_vm]).await;
+            return (false, String::new(), Some(format!("Failed to start update VM: {e}")));
         }
     };
 
-    tracing::info!(dir = %src_dir.display(), "Updating perry compiler...");
+    // Wait for IP
+    let vm_ip = match wait_for_vm_ip(update_vm, 120).await {
+        Some(ip) => ip,
+        None => {
+            let _ = vm_child.kill().await;
+            let _ = run_tart_cmd(&["stop", update_vm]).await;
+            let _ = run_tart_cmd(&["delete", update_vm]).await;
+            return (false, String::new(), Some("Timed out waiting for update VM IP".into()));
+        }
+    };
 
-    // git pull
-    let pull = tokio::process::Command::new("git")
-        .arg("pull")
-        .current_dir(src_dir)
+    tracing::info!(ip = %vm_ip, "Update VM booted");
+
+    let ssh_base = format!(
+        "{} -p '{}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 admin@{}",
+        sshpass, ssh_password, vm_ip
+    );
+
+    // Run the update script inside the VM
+    let update_script = concat!(
+        "cd ~/perry && git pull && ",
+        "cargo build --release -p perry && ",
+        "cargo build --release -p perry-runtime -p perry-stdlib && ",
+        "cargo build --release -p perry-ui-macos && ",
+        "cargo build --release -p perry-ui-ios --target aarch64-apple-ios && ",
+        "cargo build --release -p perry-runtime --target aarch64-apple-ios && ",
+        "cargo build --release -p perry-stdlib --target aarch64-apple-ios && ",
+        "cp target/release/perry ~/bin/ && ",
+        "cp target/release/libperry_runtime.a ~/bin/ && ",
+        "cp target/release/libperry_stdlib.a ~/bin/ && ",
+        "cp target/release/libperry_ui_macos.a ~/bin/ && ",
+        "cp target/aarch64-apple-ios/release/libperry_runtime.a ~/bin/libperry_runtime_ios.a && ",
+        "cp target/aarch64-apple-ios/release/libperry_stdlib.a ~/bin/libperry_stdlib_ios.a && ",
+        "cp target/aarch64-apple-ios/release/libperry_ui_ios.a ~/bin/libperry_ui_ios.a && ",
+        "~/bin/perry --version"
+    );
+
+    let build_cmd = format!("{} '{}'", ssh_base, update_script);
+    let build = tokio::process::Command::new("bash")
+        .args(["-c", &build_cmd])
         .output()
         .await;
 
-    match pull {
-        Ok(ref o) if !o.status.success() => {
+    let new_version;
+    match &build {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout).to_string();
             let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-            return (false, String::new(), Some(format!("git pull failed: {stderr}")));
+            if !o.status.success() {
+                tracing::error!("VM update failed:\nstdout: {stdout}\nstderr: {stderr}");
+                // Cleanup: stop and delete the update VM (don't save)
+                let _ = run_tart_cmd(&["stop", update_vm]).await;
+                let _ = vm_child.kill().await;
+                let _ = run_tart_cmd(&["delete", update_vm]).await;
+                return (false, String::new(), Some(format!("Update build failed: {stderr}")));
+            }
+            // Extract version from the last line of stdout
+            new_version = stdout.lines().last()
+                .and_then(|l| l.strip_prefix("perry "))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            tracing::info!(version = %new_version, "Perry updated in VM");
         }
         Err(e) => {
-            return (false, String::new(), Some(format!("git pull failed: {e}")));
+            let _ = run_tart_cmd(&["stop", update_vm]).await;
+            let _ = vm_child.kill().await;
+            let _ = run_tart_cmd(&["delete", update_vm]).await;
+            return (false, String::new(), Some(format!("SSH to update VM failed: {e}")));
         }
-        _ => {}
     }
 
-    // cargo build --release -p perry -p perry-runtime -p perry-stdlib
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let build = tokio::process::Command::new(&cargo)
-        .args(["build", "--release", "-p", "perry", "-p", "perry-runtime", "-p", "perry-stdlib"])
-        .current_dir(src_dir)
+    // Shut down VM gracefully to save state
+    let shutdown_cmd = format!("{} 'sudo shutdown -h now'", ssh_base);
+    let _ = tokio::process::Command::new("bash")
+        .args(["-c", &shutdown_cmd])
         .output()
         .await;
 
-    match build {
-        Ok(ref o) if !o.status.success() => {
-            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-            return (false, String::new(), Some(format!("cargo build failed: {stderr}")));
-        }
-        Err(e) => {
-            return (false, String::new(), Some(format!("cargo build failed: {e}")));
-        }
-        _ => {}
+    // Wait for VM to stop
+    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+    let _ = run_tart_cmd(&["stop", update_vm]).await;
+    let _ = vm_child.kill().await;
+
+    // Replace golden image with the updated VM
+    tracing::info!("Replacing golden image with updated VM...");
+    if let Err(e) = run_tart_cmd(&["delete", &golden_image]).await {
+        tracing::error!("Failed to delete old golden image: {e}");
+        let _ = run_tart_cmd(&["delete", update_vm]).await;
+        return (false, new_version.clone(), Some(format!("Failed to replace golden image: {e}")));
     }
-
-    // Also build iOS targets for macOS worker
-    let ios_build = tokio::process::Command::new(&cargo)
-        .args(["build", "--release", "-p", "perry-ui-ios", "--target", "aarch64-apple-ios"])
-        .current_dir(src_dir)
-        .output()
-        .await;
-
-    if let Ok(ref o) = ios_build {
-        if !o.status.success() {
-            tracing::warn!("perry-ui-ios build failed (non-fatal): {}", String::from_utf8_lossy(&o.stderr));
-        }
+    if let Err(e) = run_tart_cmd(&["clone", update_vm, &golden_image]).await {
+        tracing::error!("Failed to clone update VM to golden: {e}");
+        // Critical: golden image is deleted but clone failed!
+        return (false, new_version.clone(), Some(format!("CRITICAL: golden image deleted but clone failed: {e}")));
     }
+    let _ = run_tart_cmd(&["delete", update_vm]).await;
 
-    let new_version = get_perry_version(perry_binary).unwrap_or_default();
-    tracing::info!(version = %new_version, "Perry update complete");
+    tracing::info!(version = %new_version, "Golden image updated successfully");
     (true, new_version, None)
+}
+
+async fn run_tart_cmd(args: &[&str]) -> Result<String, String> {
+    let output = tokio::process::Command::new("tart")
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("tart command failed: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(format!("tart {} failed: {stderr}", args.join(" ")));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+async fn wait_for_vm_ip(vm_name: &str, timeout_secs: u64) -> Option<String> {
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed().as_secs() > timeout_secs {
+            return None;
+        }
+        if let Ok(ip) = run_tart_cmd(&["ip", vm_name]).await {
+            if !ip.is_empty() {
+                return Some(ip);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
 }
 
 pub async fn run_worker(config: WorkerConfig) {
