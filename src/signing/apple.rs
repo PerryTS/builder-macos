@@ -21,6 +21,7 @@ impl TempKeychain {
         p12_b64: &str,
         p12_password: &str,
         tmpdir: &Path,
+        preferred_identity: Option<&str>,
     ) -> Result<Self, String> {
         use base64::Engine;
         let p12_bytes = base64::engine::general_purpose::STANDARD
@@ -124,10 +125,10 @@ impl TempKeychain {
             .output()
             .map_err(|e| format!("Failed to query keychain identity: {e}"))?;
         let identity_output = String::from_utf8_lossy(&out.stdout);
-        let identity = parse_identity_from_find_output(&identity_output)
+        let identity = parse_identity_from_find_output(&identity_output, preferred_identity)
             .ok_or_else(|| {
                 cleanup(&kc_name);
-                "No valid signing identity found in .p12 certificate".to_string()
+                format!("No valid signing identity found in .p12 certificate (looking for: {:?})", preferred_identity)
             })?;
 
         // Resolve full keychain path (security appends .keychain-db)
@@ -272,8 +273,9 @@ pub fn find_installer_identity(kc_name: &str) -> Option<String> {
     None
 }
 
-fn parse_identity_from_find_output(output: &str) -> Option<String> {
+fn parse_identity_from_find_output(output: &str, preferred: Option<&str>) -> Option<String> {
     // Lines look like:   1) DEADBEEF "iPhone Distribution: Foo Corp (TEAMID)"
+    let mut all_identities = Vec::new();
     for line in output.lines() {
         let line = line.trim();
         if let Some(start) = line.find('"') {
@@ -281,13 +283,24 @@ fn parse_identity_from_find_output(output: &str) -> Option<String> {
                 if end > start {
                     let identity = &line[start + 1..end];
                     if !identity.is_empty() {
-                        return Some(identity.to_string());
+                        all_identities.push(identity.to_string());
                     }
                 }
             }
         }
     }
-    None
+
+    // If a preferred identity is specified, find it (substring match)
+    if let Some(pref) = preferred {
+        if !pref.is_empty() {
+            if let Some(found) = all_identities.iter().find(|id| id.contains(pref)) {
+                return Some(found.clone());
+            }
+        }
+    }
+
+    // Fallback to first identity
+    all_identities.into_iter().next()
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
