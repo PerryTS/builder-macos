@@ -510,6 +510,24 @@ async fn run_macos_pipeline(
                         tracing::warn!("DMG signing failed (non-fatal): {}", String::from_utf8_lossy(&o.stderr));
                     }
                 }
+
+                // Notarize the final signed DMG
+                send_stage(progress, StageName::Notarizing, "Notarizing signed DMG");
+                apple::notarize_dmg(
+                    &dmg_path,
+                    request.credentials.apple_p8_key.as_deref().unwrap(),
+                    request.credentials.apple_key_id.as_deref().unwrap(),
+                    request.credentials.apple_issuer_id.as_deref().unwrap(),
+                    tmpdir,
+                )
+                .await?;
+
+                // Staple the DMG
+                let _ = tokio::process::Command::new("xcrun")
+                    .args(["stapler", "staple", dmg_path.to_str().unwrap_or("")])
+                    .output()
+                    .await;
+
                 send_progress(progress, StageName::Packaging, 100, None);
                 send_progress(progress, StageName::Notarizing, 100, None);
             } else {
