@@ -455,20 +455,23 @@ async fn run_macos_pipeline(
         } else {
             // Notarize path: create .dmg, notarize, return DMG
 
-            // Stage 6: Package DMG
-            send_stage(progress, StageName::Packaging, "Creating DMG");
-            check_cancelled(cancelled)?;
-            let dmg_path = tmpdir.join(format!("{}.dmg", request.manifest.app_name));
-            macos::create_dmg(&request.manifest.app_name, &app_path, &dmg_path).await?;
-            send_progress(progress, StageName::Packaging, 100, None);
-
-            // Stage 7: Notarize
-            send_stage(progress, StageName::Notarizing, "Notarizing with Apple");
-            check_cancelled(cancelled)?;
+            // Stage 6: Package + Notarize
             let has_notarization = request.credentials.apple_key_id.is_some()
                 && request.credentials.apple_issuer_id.is_some()
                 && request.credentials.apple_p8_key.is_some();
+
+            let dmg_path = tmpdir.join(format!("{}.dmg", request.manifest.app_name));
+
             if has_notarization {
+                // Create initial DMG for notarization submission
+                send_stage(progress, StageName::Packaging, "Creating DMG for notarization");
+                check_cancelled(cancelled)?;
+                macos::create_dmg(&request.manifest.app_name, &app_path, &dmg_path).await?;
+                send_progress(progress, StageName::Packaging, 50, None);
+
+                // Notarize the DMG
+                send_stage(progress, StageName::Notarizing, "Submitting to Apple for notarization");
+                check_cancelled(cancelled)?;
                 apple::notarize_dmg(
                     &dmg_path,
                     request.credentials.apple_p8_key.as_deref().unwrap(),
@@ -477,8 +480,46 @@ async fn run_macos_pipeline(
                     tmpdir,
                 )
                 .await?;
+
+                // Staple the notarization ticket to the .app
+                send_stage(progress, StageName::Notarizing, "Stapling notarization ticket");
+                let _ = tokio::process::Command::new("xcrun")
+                    .args(["stapler", "staple", app_path.to_str().unwrap_or("")])
+                    .output()
+                    .await;
+
+                // Recreate DMG with the stapled .app
+                send_stage(progress, StageName::Packaging, "Recreating DMG with stapled app");
+                let _ = std::fs::remove_file(&dmg_path);
+                macos::create_dmg(&request.manifest.app_name, &app_path, &dmg_path).await?;
+
+                // Sign the DMG itself
+                let sign_identity = temp_kc.as_ref()
+                    .map(|kc| kc.identity.as_str())
+                    .unwrap_or("Developer ID Application");
+                let kc_path = temp_kc.as_ref().map(|kc| kc.path.as_str());
+                let mut sign_cmd = tokio::process::Command::new("codesign");
+                sign_cmd.arg("--force").arg("--sign").arg(sign_identity);
+                if let Some(kc) = kc_path {
+                    sign_cmd.arg("--keychain").arg(kc);
+                }
+                sign_cmd.arg(&dmg_path);
+                let sign_out = sign_cmd.output().await;
+                if let Ok(ref o) = sign_out {
+                    if !o.status.success() {
+                        tracing::warn!("DMG signing failed (non-fatal): {}", String::from_utf8_lossy(&o.stderr));
+                    }
+                }
+                send_progress(progress, StageName::Packaging, 100, None);
+                send_progress(progress, StageName::Notarizing, 100, None);
+            } else {
+                // No notarization credentials — just create unsigned DMG
+                send_stage(progress, StageName::Packaging, "Creating DMG");
+                check_cancelled(cancelled)?;
+                macos::create_dmg(&request.manifest.app_name, &app_path, &dmg_path).await?;
+                send_progress(progress, StageName::Packaging, 100, None);
+                send_progress(progress, StageName::Notarizing, 100, None);
             }
-            send_progress(progress, StageName::Notarizing, 100, None);
 
             // Verify binary before returning
             run_verification(config, progress, cancelled, &dmg_path, "macos-arm64", "gui").await?;
