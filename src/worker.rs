@@ -58,7 +58,10 @@ async fn upload_artifact(
 
 /// Download a base64-encoded tarball from the hub and write the decoded bytes to a temp file.
 async fn download_tarball(url: &str, job_id: &str, auth_token: Option<&str>) -> Result<PathBuf, String> {
-    let client = reqwest::Client::new();
+    tracing::info!(url = %url, "Downloading tarball");
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
     let mut req = client.get(url);
     if let Some(token) = auth_token {
         req = req.header("Authorization", format!("Bearer {token}"));
@@ -66,7 +69,7 @@ async fn download_tarball(url: &str, job_id: &str, auth_token: Option<&str>) -> 
     let resp = req
         .send()
         .await
-        .map_err(|e| format!("HTTP request failed: {e}"))?;
+        .map_err(|e| format!("HTTP request failed: {e} (url={url}, is_builder={}, is_connect={}, is_timeout={})", e.is_builder(), e.is_connect(), e.is_timeout()))?;
 
     if !resp.status().is_success() {
         return Err(format!("Hub returned HTTP {}", resp.status()));
