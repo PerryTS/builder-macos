@@ -213,11 +213,11 @@ async fn run_macos_pipeline(
             } else {
                 None
             };
-            if let Some(ref kc) = notarize_kc {
-                kc.add_to_search_list().map_err(|e| format!("Failed to add keychain to search list: {e}"))?;
-            }
-            let kc_path = notarize_kc.as_ref().map(|kc| kc.path.as_str());
-            apple::codesign_app(identity, entitlements_path.as_deref(), &app_path, true, kc_path).await?;
+            let notarize_p12 = request.credentials.apple_notarize_certificate_p12_base64.as_deref()
+                .map(|b64| write_p12_temp(tmpdir, b64, "notarize")).transpose()?;
+            apple::codesign_app(identity, entitlements_path.as_deref(), &app_path, true, None,
+                notarize_p12.as_deref(), request.credentials.apple_notarize_certificate_password.as_deref(),
+            ).await?;
         }
         send_progress(progress, StageName::Signing, 50, Some("Developer ID signed"));
 
@@ -293,11 +293,11 @@ async fn run_macos_pipeline(
             } else {
                 None
             };
-            if let Some(ref kc) = appstore_kc {
-                kc.add_to_search_list().map_err(|e| format!("Failed to add keychain to search list: {e}"))?;
-            }
-            let kc_path = appstore_kc.as_ref().map(|kc| kc.path.as_str());
-            apple::codesign_app(identity, entitlements_path.as_deref(), &app_path_appstore, false, kc_path).await?;
+            let appstore_p12 = request.credentials.apple_certificate_p12_base64.as_deref()
+                .map(|b64| write_p12_temp(tmpdir, b64, "appstore")).transpose()?;
+            apple::codesign_app(identity, entitlements_path.as_deref(), &app_path_appstore, false, None,
+                appstore_p12.as_deref(), request.credentials.apple_certificate_password.as_deref(),
+            ).await?;
         }
         send_progress(progress, StageName::Signing, 100, Some("Apple Distribution signed"));
 
@@ -385,16 +385,15 @@ async fn run_macos_pipeline(
             } else {
                 None
             };
-            if let Some(ref kc) = temp_kc {
-                kc.add_to_search_list().map_err(|e| format!("Failed to add keychain to search list: {e}"))?;
-            }
-            let kc_path = temp_kc.as_ref().map(|kc| kc.path.as_str());
+            let single_p12 = request.credentials.apple_certificate_p12_base64.as_deref()
+                .map(|b64| write_p12_temp(tmpdir, b64, "single")).transpose()?;
             apple::codesign_app(
                 identity,
                 entitlements_path.as_deref(),
                 &app_path,
                 !is_appstore, // hardened runtime for notarization, not needed for App Store
-                kc_path,
+                None,
+                single_p12.as_deref(), request.credentials.apple_certificate_password.as_deref(),
             )
             .await?;
         }
@@ -658,13 +657,15 @@ async fn run_ios_pipeline(
         if let Some(ref kc) = temp_kc {
             kc.add_to_search_list().map_err(|e| format!("Failed to add keychain to search list: {e}"))?;
         }
-        let kc_path = temp_kc.as_ref().map(|kc| kc.path.as_str());
+        let ios_p12 = request.credentials.apple_certificate_p12_base64.as_deref()
+            .map(|b64| write_p12_temp(tmpdir, b64, "ios")).transpose()?;
         apple::codesign_app(
             identity,
             Some(&entitlements_path),
             &app_path,
             false, // iOS: no hardened runtime flag
-            kc_path,
+            None,
+            ios_p12.as_deref(), request.credentials.apple_certificate_password.as_deref(),
         )
         .await?;
     }
@@ -1146,4 +1147,16 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     base64::engine::general_purpose::STANDARD
         .decode(input.trim())
         .map_err(|e| format!("Invalid base64: {e}"))
+}
+
+/// Write base64-encoded p12 data to a temp file and return the path.
+fn write_p12_temp(tmpdir: &std::path::Path, p12_b64: &str, suffix: &str) -> Result<std::path::PathBuf, String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(p12_b64.trim())
+        .map_err(|e| format!("Failed to decode p12: {e}"))?;
+    let path = tmpdir.join(format!("signing-{suffix}.p12"));
+    std::fs::write(&path, &bytes)
+        .map_err(|e| format!("Failed to write p12 temp file: {e}"))?;
+    Ok(path)
 }

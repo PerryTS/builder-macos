@@ -337,26 +337,52 @@ impl std::fmt::Debug for AppleCredentials {
 }
 
 pub async fn codesign_app(
-    identity: &str,
+    _identity: &str,
     entitlements: Option<&Path>,
     app_path: &Path,
     hardened_runtime: bool,
-    keychain: Option<&str>,
+    _keychain: Option<&str>,
+    p12_path: Option<&Path>,
+    p12_password: Option<&str>,
 ) -> Result<(), String> {
+    // Use rcodesign (Rust-based, no keychain/securityd dependency) if p12 is available.
+    // Falls back to Apple's codesign for ad-hoc signing.
+    if let (Some(p12), Some(pass)) = (p12_path, p12_password) {
+        let mut cmd = Command::new("rcodesign");
+        cmd.arg("sign");
+        cmd.arg("--p12-file").arg(p12);
+        cmd.arg("--p12-password").arg(pass);
+        if hardened_runtime {
+            cmd.arg("--code-signature-flags").arg("runtime");
+        }
+        if let Some(ent) = entitlements {
+            cmd.arg("--entitlements-xml-path").arg(ent);
+        }
+        cmd.arg(app_path);
+
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run rcodesign: {e}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(format!("rcodesign failed: {stderr}\n{stdout}"));
+        }
+        return Ok(());
+    }
+
+    // Fallback: Apple's codesign (for ad-hoc or when no p12 provided)
     let mut cmd = Command::new("codesign");
     cmd.arg("--force");
     if hardened_runtime {
         cmd.arg("--options").arg("runtime");
     }
-    cmd.arg("--sign").arg(identity);
+    cmd.arg("--sign").arg(_identity);
 
-    if let Some(kc) = keychain {
+    if let Some(kc) = _keychain {
         cmd.arg("--keychain").arg(kc);
-        // Ensure both the temp keychain AND system keychain are in the search list
-        // so codesign can validate the full certificate chain
-        let _ = std::process::Command::new("security")
-            .args(["list-keychains", "-d", "user", "-s", kc, "/Library/Keychains/System.keychain"])
-            .status();
     }
 
     if let Some(ent) = entitlements {
