@@ -352,6 +352,11 @@ pub async fn codesign_app(
 
     if let Some(kc) = keychain {
         cmd.arg("--keychain").arg(kc);
+        // Ensure both the temp keychain AND system keychain are in the search list
+        // so codesign can validate the full certificate chain
+        let _ = std::process::Command::new("security")
+            .args(["list-keychains", "-d", "user", "-s", kc, "/Library/Keychains/System.keychain"])
+            .status();
     }
 
     if let Some(ent) = entitlements {
