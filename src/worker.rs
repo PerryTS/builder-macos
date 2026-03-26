@@ -244,6 +244,11 @@ async fn run_perry_update(perry_binary: &str) -> (bool, String, Option<String>) 
         "cp target/aarch64-apple-ios/release/libperry_runtime.a ~/bin/libperry_runtime_ios.a.tmp && mv -f ~/bin/libperry_runtime_ios.a.tmp ~/bin/libperry_runtime_ios.a; ",
         "cp target/aarch64-apple-ios/release/libperry_stdlib.a ~/bin/libperry_stdlib_ios.a.tmp && mv -f ~/bin/libperry_stdlib_ios.a.tmp ~/bin/libperry_stdlib_ios.a; ",
         "cp target/aarch64-apple-ios/release/libperry_ui_ios.a ~/bin/libperry_ui_ios.a.tmp && mv -f ~/bin/libperry_ui_ios.a.tmp ~/bin/libperry_ui_ios.a; ",
+        // Install Apple WWDR intermediate CAs (G3, G6) so codesign can validate cert chains.
+        // These get lost when the golden image is rebuilt from a clone.
+        "curl -sL https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer -o /tmp/wwdr-g3.cer && sudo security add-certificates -k /Library/Keychains/System.keychain /tmp/wwdr-g3.cer 2>/dev/null; ",
+        "curl -sL https://www.apple.com/certificateauthority/AppleWWDRCAG6.cer -o /tmp/wwdr-g6.cer && sudo security add-certificates -k /Library/Keychains/System.keychain /tmp/wwdr-g6.cer 2>/dev/null; ",
+        "rm -f /tmp/wwdr-g3.cer /tmp/wwdr-g6.cer; ",
         "~/bin/perry --version"
     );
 
