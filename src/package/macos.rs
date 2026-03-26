@@ -18,6 +18,7 @@ pub fn create_app_bundle(
     icns_path: Option<&Path>,
     app_path: &Path,
     sdk_info: Option<&MacSdkInfo>,
+    provisioning_profile: Option<&Path>,
 ) -> Result<(), String> {
     let contents = app_path.join("Contents");
     let macos_dir = contents.join("MacOS");
@@ -55,6 +56,14 @@ pub fn create_app_bundle(
     let info_plist = generate_info_plist(manifest, icon_file_name.as_deref(), sdk_info);
     std::fs::write(contents.join("Info.plist"), info_plist)
         .map_err(|e| format!("Failed to write Info.plist: {e}"))?;
+
+    // Embed provisioning profile (required for Mac App Store / TestFlight)
+    if let Some(profile) = provisioning_profile {
+        if profile.exists() {
+            std::fs::copy(profile, contents.join("embedded.provisionprofile"))
+                .map_err(|e| format!("Failed to embed provisioning profile: {e}"))?;
+        }
+    }
 
     Ok(())
 }

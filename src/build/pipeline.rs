@@ -177,7 +177,7 @@ async fn run_macos_pipeline(
     check_cancelled(cancelled)?;
     let app_path = tmpdir.join(format!("{}.app", request.manifest.app_name));
     let icns_opt = if icns_path.exists() { Some(icns_path.as_path()) } else { None };
-    macos::create_app_bundle(&request.manifest, binary_path, icns_opt, &app_path, Some(&mac_sdk_info))?;
+    macos::create_app_bundle(&request.manifest, binary_path, icns_opt, &app_path, Some(&mac_sdk_info), None)?;
     send_progress(progress, StageName::Bundling, 100, None);
 
     if is_both {
@@ -258,8 +258,20 @@ async fn run_macos_pipeline(
         send_stage(progress, StageName::Signing, "Re-signing with Apple Distribution (for App Store)");
         check_cancelled(cancelled)?;
 
+        // Decode provisioning profile for App Store / TestFlight
+        let macos_profile_path = if let Some(ref b64) = request.credentials.provisioning_profile_base64 {
+            let decoded = base64_decode(b64)?;
+            let p = tmpdir.join("embedded.provisionprofile");
+            std::fs::write(&p, decoded)
+                .map_err(|e| format!("Failed to write provisioning profile: {e}"))?;
+            Some(p)
+        } else {
+            None
+        };
+
         let app_path_appstore = tmpdir.join(format!("{}-appstore.app", request.manifest.app_name));
-        macos::create_app_bundle(&request.manifest, binary_path, icns_opt, &app_path_appstore, Some(&mac_sdk_info))?;
+        macos::create_app_bundle(&request.manifest, binary_path, icns_opt, &app_path_appstore, Some(&mac_sdk_info),
+            macos_profile_path.as_deref())?;
 
         let appstore_kc = if let (Some(p12_b64), Some(p12_pass)) = (
             request.credentials.apple_certificate_p12_base64.as_deref(),
@@ -355,6 +367,16 @@ async fn run_macos_pipeline(
         Ok(dmg_artifact)
     } else {
         // --- Single-mode: appstore OR notarize ---
+
+        // Embed provisioning profile for App Store / TestFlight (single-mode)
+        if is_appstore {
+            if let Some(ref b64) = request.credentials.provisioning_profile_base64 {
+                let decoded = base64_decode(b64)?;
+                let profile_dest = app_path.join("Contents/embedded.provisionprofile");
+                std::fs::write(&profile_dest, decoded)
+                    .map_err(|e| format!("Failed to embed provisioning profile: {e}"))?;
+            }
+        }
 
         // Stage 5: Code sign
         send_stage(progress, StageName::Signing, "Signing application");
