@@ -522,11 +522,11 @@ async fn ssh_exec_streaming(
         .map_err(|e| format!("Failed to wait for SSH process: {e}"))?;
 
     if !status.success() {
-        // Extract BUILD_ERROR from stderr if present
+        // Extract BUILD_ERROR from stderr if present, including subsequent lines
+        // (the error may be multiline, e.g. compiler errors with context)
         let build_error = full_stderr
-            .lines()
-            .find(|l| l.starts_with("BUILD_ERROR:"))
-            .map(|l| l.strip_prefix("BUILD_ERROR:").unwrap().trim().to_string());
+            .find("BUILD_ERROR:")
+            .map(|pos| full_stderr[pos + "BUILD_ERROR:".len()..].trim().to_string());
         let err_msg = build_error.unwrap_or_else(|| {
             if full_stderr.trim().is_empty() {
                 format!("Build exited with {status}")
