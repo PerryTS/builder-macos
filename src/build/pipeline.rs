@@ -193,11 +193,11 @@ async fn run_macos_pipeline(
             request.credentials.apple_notarize_certificate_p12_base64.as_deref(),
             request.credentials.apple_notarize_certificate_password.as_deref(),
         ) {
-            Some(apple::TempKeychain::create(
+            apple::TempKeychain::create(
                 &format!("{}-notarize", request.job_id),
                 p12_b64, p12_pass, tmpdir,
                 request.credentials.apple_notarize_signing_identity.as_deref(),
-            ).await?)
+            ).await.ok()
         } else {
             None
         };
@@ -265,19 +265,22 @@ async fn run_macos_pipeline(
             request.credentials.apple_certificate_p12_base64.as_deref(),
             request.credentials.apple_certificate_password.as_deref(),
         ) {
-            let kc = apple::TempKeychain::create(
+            match apple::TempKeychain::create(
                 &format!("{}-appstore", request.job_id),
                 p12_b64, p12_pass, tmpdir,
                 request.credentials.apple_signing_identity.as_deref(),
-            ).await?;
-            // Import separate installer cert into same keychain if provided
-            if let (Some(inst_b64), Some(inst_pass)) = (
-                request.credentials.apple_installer_certificate_p12_base64.as_deref(),
-                request.credentials.apple_installer_certificate_password.as_deref(),
-            ) {
-                kc.import_additional_p12(inst_b64, inst_pass, tmpdir)?;
+            ).await {
+                Ok(kc) => {
+                    if let (Some(inst_b64), Some(inst_pass)) = (
+                        request.credentials.apple_installer_certificate_p12_base64.as_deref(),
+                        request.credentials.apple_installer_certificate_password.as_deref(),
+                    ) {
+                        let _ = kc.import_additional_p12(inst_b64, inst_pass, tmpdir);
+                    }
+                    Some(kc)
+                }
+                Err(e) => { tracing::warn!("TempKeychain failed: {e}"); None }
             }
-            Some(kc)
         } else {
             None
         };
@@ -357,19 +360,27 @@ async fn run_macos_pipeline(
         send_stage(progress, StageName::Signing, "Signing application");
         check_cancelled(cancelled)?;
 
+        // Try creating TempKeychain for legacy codesign fallback, but don't fail if it errors
+        // (rcodesign doesn't need it — it reads the p12 directly)
         let temp_kc = if let (Some(p12_b64), Some(p12_pass)) = (
             request.credentials.apple_certificate_p12_base64.as_deref(),
             request.credentials.apple_certificate_password.as_deref(),
         ) {
-            let kc = apple::TempKeychain::create(&request.job_id, p12_b64, p12_pass, tmpdir, request.credentials.apple_signing_identity.as_deref()).await?;
-            // Import separate installer cert into same keychain if provided
-            if let (Some(inst_b64), Some(inst_pass)) = (
-                request.credentials.apple_installer_certificate_p12_base64.as_deref(),
-                request.credentials.apple_installer_certificate_password.as_deref(),
-            ) {
-                kc.import_additional_p12(inst_b64, inst_pass, tmpdir)?;
+            match apple::TempKeychain::create(&request.job_id, p12_b64, p12_pass, tmpdir, request.credentials.apple_signing_identity.as_deref()).await {
+                Ok(kc) => {
+                    if let (Some(inst_b64), Some(inst_pass)) = (
+                        request.credentials.apple_installer_certificate_p12_base64.as_deref(),
+                        request.credentials.apple_installer_certificate_password.as_deref(),
+                    ) {
+                        let _ = kc.import_additional_p12(inst_b64, inst_pass, tmpdir);
+                    }
+                    Some(kc)
+                }
+                Err(e) => {
+                    tracing::warn!("TempKeychain creation failed (will use rcodesign): {e}");
+                    None
+                }
             }
-            Some(kc)
         } else {
             None
         };
@@ -639,7 +650,7 @@ async fn run_ios_pipeline(
         request.credentials.apple_certificate_p12_base64.as_deref(),
         request.credentials.apple_certificate_password.as_deref(),
     ) {
-        Some(apple::TempKeychain::create(&request.job_id, p12_b64, p12_pass, tmpdir, request.credentials.apple_signing_identity.as_deref()).await?)
+        apple::TempKeychain::create(&request.job_id, p12_b64, p12_pass, tmpdir, request.credentials.apple_signing_identity.as_deref()).await.ok()
     } else {
         None
     };
