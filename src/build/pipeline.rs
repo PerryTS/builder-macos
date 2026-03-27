@@ -33,6 +33,12 @@ pub async fn execute_build(
     cancelled: Arc<AtomicBool>,
     progress: ProgressSender,
 ) -> Result<PathBuf, String> {
+    // Check if this is a sign-only job (precompiled by Linux worker)
+    let target = determine_target(&request.manifest.targets);
+    if matches!(target, BuildTarget::MacOsSign | BuildTarget::IosSign) {
+        return run_sign_only_pipeline(request, config, &cancelled, &progress, &target).await;
+    }
+
     // Validate manifest fields before any filesystem or subprocess operations
     validate::validate_manifest(&request.manifest)?;
 
@@ -80,6 +86,7 @@ async fn run_pipeline(
         BuildTarget::Ios => Some("ios"),
         BuildTarget::Android => Some("android"),
         BuildTarget::MacOs => None,
+        BuildTarget::MacOsSign | BuildTarget::IosSign => unreachable!("sign-only handled earlier"),
     };
     compiler::compile(
         &request.manifest,
@@ -142,6 +149,7 @@ async fn run_pipeline(
             run_android_pipeline(request, config, cancelled, progress, tmpdir, &actual_binary, &project_dir)
                 .await
         }
+        BuildTarget::MacOsSign | BuildTarget::IosSign => unreachable!("sign-only handled earlier"),
     }
 }
 
@@ -965,17 +973,176 @@ fn copy_artifact(
     Ok(dest)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Sign-only pipeline for precompiled bundles from Linux cross-compilation.
+/// The tarball contains a precompiled .ipa (iOS) or .tar.gz with .app (macOS),
+/// not source code. We extract, sign, and package/upload.
+async fn run_sign_only_pipeline(
+    request: &BuildRequest,
+    config: &WorkerConfig,
+    cancelled: &Arc<AtomicBool>,
+    progress: &ProgressSender,
+    target: &BuildTarget,
+) -> Result<PathBuf, String> {
+    let tmpdir = create_build_tmpdir().map_err(|e| format!("Failed to create tmpdir: {e}"))?;
+
+    let result = async {
+        // Stage 1: Extract precompiled bundle
+        send_stage(progress, StageName::Extracting, "Extracting precompiled bundle");
+        check_cancelled(cancelled)?;
+
+        let extract_dir = tmpdir.join("precompiled");
+        std::fs::create_dir_all(&extract_dir)
+            .map_err(|e| format!("Failed to create extract dir: {e}"))?;
+        extract_tarball(&request.tarball_path, &extract_dir)?;
+        send_progress(progress, StageName::Extracting, 100, None);
+
+        // Find the .app bundle in the extracted content
+        let app_path = find_app_bundle(&extract_dir)?;
+        tracing::info!("Found precompiled .app: {}", app_path.display());
+
+        // Stage 2: Sign with rcodesign
+        send_stage(progress, StageName::Signing, "Signing precompiled bundle");
+        check_cancelled(cancelled)?;
+
+        let p12_path = if let Some(ref b64) = request.credentials.apple_certificate_p12_base64 {
+            let decoded = base64_decode(b64)?;
+            let p = tmpdir.join("signing.p12");
+            std::fs::write(&p, decoded)
+                .map_err(|e| format!("Failed to write p12: {e}"))?;
+            Some(p)
+        } else {
+            None
+        };
+
+        let identity = request.credentials.apple_signing_identity.as_deref();
+
+        if let Some(ref p12) = p12_path {
+            let entitlements_path = if request.manifest.entitlements.is_some() {
+                let p = tmpdir.join("entitlements.plist");
+                macos::write_entitlements_plist(&request.manifest, &p)?;
+                Some(p)
+            } else {
+                None
+            };
+
+            apple::codesign_app(
+                identity.unwrap_or(""),
+                entitlements_path.as_deref(),
+                &app_path,
+                matches!(target, BuildTarget::MacOsSign), // hardened runtime for macOS
+                None,
+                Some(p12.as_path()),
+                request.credentials.apple_certificate_password.as_deref(),
+            ).await?;
+        }
+        send_progress(progress, StageName::Signing, 100, None);
+
+        match target {
+            BuildTarget::IosSign => {
+                // Stage 3: Create signed .ipa
+                send_stage(progress, StageName::Packaging, "Creating signed .ipa");
+                check_cancelled(cancelled)?;
+
+                let ipa_path = tmpdir.join(format!("{}.ipa", request.manifest.app_name));
+                ios::create_ipa(&request.manifest.app_name, &app_path, &ipa_path).await?;
+                send_progress(progress, StageName::Packaging, 100, None);
+
+                // Stage 4: Upload to App Store Connect
+                let has_creds = request.credentials.apple_key_id.is_some()
+                    && request.credentials.apple_issuer_id.is_some()
+                    && request.credentials.apple_p8_key.is_some();
+
+                if has_creds {
+                    send_stage(progress, StageName::Publishing, "Uploading to App Store Connect");
+                    check_cancelled(cancelled)?;
+
+                    let result = appstore::upload_to_appstore(
+                        &ipa_path,
+                        request.credentials.apple_p8_key.as_deref().unwrap(),
+                        request.credentials.apple_key_id.as_deref().unwrap(),
+                        request.credentials.apple_issuer_id.as_deref().unwrap(),
+                        &tmpdir,
+                    ).await;
+                    match result {
+                        Ok(r) => tracing::info!("App Store upload: {}", r.message),
+                        Err(e) => return Err(format!("App Store upload failed:\n{e}")),
+                    }
+                    send_progress(progress, StageName::Publishing, 100, None);
+                }
+
+                let artifact = copy_artifact(&ipa_path, &request.manifest.app_name, &request.job_id, "ipa")?;
+                Ok(artifact)
+            }
+            BuildTarget::MacOsSign => {
+                // Stage 3: Create DMG
+                send_stage(progress, StageName::Packaging, "Creating DMG");
+                check_cancelled(cancelled)?;
+
+                let dmg_path = tmpdir.join(format!("{}.dmg", request.manifest.app_name));
+                macos::create_dmg(&request.manifest.app_name, &app_path, &dmg_path).await?;
+                send_progress(progress, StageName::Packaging, 100, None);
+
+                // Stage 4: Notarize if credentials available
+                let has_notarize_creds = request.credentials.apple_key_id.is_some()
+                    && request.credentials.apple_issuer_id.is_some()
+                    && request.credentials.apple_p8_key.is_some();
+
+                if has_notarize_creds {
+                    send_stage(progress, StageName::Notarizing, "Notarizing DMG");
+                    check_cancelled(cancelled)?;
+
+                    let notarize_result = apple::notarize_dmg(
+                        &dmg_path,
+                        request.credentials.apple_p8_key.as_deref().unwrap(),
+                        request.credentials.apple_key_id.as_deref().unwrap(),
+                        request.credentials.apple_issuer_id.as_deref().unwrap(),
+                        &tmpdir,
+                    ).await;
+                    match notarize_result {
+                        Ok(()) => tracing::info!("Notarization succeeded"),
+                        Err(e) => tracing::warn!("Notarization failed (non-fatal): {e}"),
+                    }
+                    send_progress(progress, StageName::Notarizing, 100, None);
+                }
+
+                let artifact = copy_artifact(&dmg_path, &request.manifest.app_name, &request.job_id, "dmg")?;
+                Ok(artifact)
+            }
+            _ => Err("Unexpected target in sign-only pipeline".into()),
+        }
+    }.await;
+
+    cleanup_tmpdir(&tmpdir);
+    result
+}
+
+/// Find a .app bundle in the extracted directory (searches recursively)
+fn find_app_bundle(dir: &std::path::Path) -> Result<PathBuf, String> {
+    for entry in walkdir::WalkDir::new(dir).max_depth(3) {
+        if let Ok(e) = entry {
+            if e.path().extension().map_or(false, |ext| ext == "app") && e.path().is_dir() {
+                return Ok(e.path().to_path_buf());
+            }
+        }
+    }
+    Err(format!("No .app bundle found in precompiled archive at {}", dir.display()))
+}
+
+#[derive(PartialEq)]
 enum BuildTarget {
     MacOs,
     Ios,
     Android,
+    MacOsSign,
+    IosSign,
 }
 
 fn determine_target(targets: &[String]) -> BuildTarget {
     for t in targets {
         match t.to_lowercase().as_str() {
             "ios" => return BuildTarget::Ios,
+            "ios-sign" => return BuildTarget::IosSign,
+            "macos-sign" => return BuildTarget::MacOsSign,
             "android" => return BuildTarget::Android,
             _ => {}
         }
