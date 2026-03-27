@@ -402,7 +402,7 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
     // Send worker_hello
     let perry_version = get_perry_version(&config.perry_binary);
     let hello = WorkerMessage::WorkerHello {
-        capabilities: vec!["ios".into(), "macos-sign".into(), "ios-sign".into()],
+        capabilities: vec!["macos-sign".into(), "ios-sign".into()],
         name: config.worker_name.clone().unwrap_or_else(|| {
             hostname::get()
                 .map(|h| h.to_string_lossy().to_string())
