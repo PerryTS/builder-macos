@@ -1016,6 +1016,30 @@ async fn run_sign_only_pipeline(
 
         let identity = request.credentials.apple_signing_identity.as_deref();
 
+        // Embed provisioning profile for iOS (required for App Store / TestFlight)
+        if matches!(target, BuildTarget::IosSign) {
+            if let Some(ref b64) = request.credentials.provisioning_profile_base64 {
+                let decoded = base64_decode(b64)?;
+                let profile_dest = app_path.join("embedded.mobileprovision");
+                std::fs::write(&profile_dest, decoded)
+                    .map_err(|e| format!("Failed to embed provisioning profile: {e}"))?;
+                tracing::info!("Embedded provisioning profile into .app");
+            }
+        }
+        // Embed provisioning profile for macOS App Store
+        if matches!(target, BuildTarget::MacOsSign) {
+            if let Some(ref b64) = request.credentials.provisioning_profile_base64 {
+                let decoded = base64_decode(b64)?;
+                let profile_dest = app_path.join("Contents/embedded.provisionprofile");
+                if let Some(parent) = profile_dest.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                std::fs::write(&profile_dest, decoded)
+                    .map_err(|e| format!("Failed to embed provisioning profile: {e}"))?;
+                tracing::info!("Embedded provisioning profile into .app");
+            }
+        }
+
         if let Some(ref p12) = p12_path {
             let entitlements_path = if request.manifest.entitlements.is_some() {
                 let p = tmpdir.join("entitlements.plist");
