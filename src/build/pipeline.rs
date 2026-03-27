@@ -1031,16 +1031,35 @@ async fn run_sign_only_pipeline(
                 std::fs::write(assets_dir.join("Contents.json"), r#"{"info":{"author":"perry","version":1}}"#).ok();
 
                 // Compile asset catalog using xcrun actool
+                let partial_plist = tmpdir.join("partial-info.plist");
                 let actool_result = tokio::process::Command::new("xcrun")
                     .args(["actool", "--compile", app_path.to_str().unwrap_or(""),
                            "--platform", "iphoneos", "--minimum-deployment-target", "17.0",
-                           "--app-icon", "AppIcon", "--output-partial-info-plist", "/dev/null"])
+                           "--app-icon", "AppIcon",
+                           "--output-partial-info-plist", partial_plist.to_str().unwrap_or("")])
                     .arg(assets_dir.to_str().unwrap_or(""))
                     .output()
                     .await;
                 match actool_result {
                     Ok(o) if o.status.success() => {
                         tracing::info!("Compiled iOS asset catalog (Assets.car)");
+                        // Merge partial Info.plist from actool into the app's Info.plist
+                        // This adds CFBundleIconName and other asset catalog keys
+                        if partial_plist.exists() {
+                            let merge_result = tokio::process::Command::new("/usr/libexec/PlistBuddy")
+                                .args(["-c", "Merge", partial_plist.to_str().unwrap_or(""),
+                                       app_path.join("Info.plist").to_str().unwrap_or("")])
+                                .output()
+                                .await;
+                            // Fallback: just set CFBundleIconName directly
+                            if merge_result.is_err() || !merge_result.as_ref().unwrap().status.success() {
+                                let _ = tokio::process::Command::new("/usr/libexec/PlistBuddy")
+                                    .args(["-c", "Add :CFBundleIconName string AppIcon",
+                                           app_path.join("Info.plist").to_str().unwrap_or("")])
+                                    .output()
+                                    .await;
+                            }
+                        }
                     }
                     Ok(o) => {
                         tracing::warn!("actool failed (non-fatal): {}", String::from_utf8_lossy(&o.stderr));
