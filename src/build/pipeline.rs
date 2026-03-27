@@ -1018,15 +1018,42 @@ async fn run_sign_only_pipeline(
 
         // Compile icon asset catalog on macOS (xcrun actool is macOS-only)
         if matches!(target, BuildTarget::IosSign) {
-            let icon_1024 = app_path.join("Icon-1024.png");
-            if icon_1024.exists() {
+            // Find a source icon — check multiple names the Linux worker may have used
+            let icon_src = ["Icon-1024.png", "AppIcon.png", "icon.png"]
+                .iter()
+                .map(|n| app_path.join(n))
+                .find(|p| p.exists());
+
+            if let Some(icon_path) = icon_src {
                 let assets_dir = tmpdir.join("Assets.xcassets");
                 let iconset = assets_dir.join("AppIcon.appiconset");
                 std::fs::create_dir_all(&iconset).ok();
-                // Copy icon as the source
-                std::fs::copy(&icon_1024, iconset.join("icon_1024x1024.png")).ok();
-                // Generate Contents.json for asset catalog
-                let contents_json = r#"{"images":[{"filename":"icon_1024x1024.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"perry","version":1}}"#;
+
+                // Generate all required icon sizes from source
+                if let Ok(img) = image::open(&icon_path) {
+                    for (size, name) in &[
+                        (1024u32, "icon_1024.png"),
+                        (180, "icon_180.png"),   // iPhone @3x
+                        (120, "icon_120.png"),   // iPhone @2x
+                        (167, "icon_167.png"),   // iPad Pro @2x
+                        (152, "icon_152.png"),   // iPad @2x
+                        (76, "icon_76.png"),     // iPad @1x
+                    ] {
+                        let resized = img.resize_exact(*size, *size, image::imageops::FilterType::Lanczos3);
+                        resized.save(iconset.join(name)).ok();
+                        // Also copy fallback PNGs into .app bundle for older iOS
+                        resized.save(app_path.join(format!("Icon-{size}.png"))).ok();
+                    }
+                }
+
+                let contents_json = r#"{"images":[
+                    {"filename":"icon_1024.png","idiom":"universal","platform":"ios","size":"1024x1024"},
+                    {"filename":"icon_180.png","idiom":"iphone","scale":"3x","size":"60x60"},
+                    {"filename":"icon_120.png","idiom":"iphone","scale":"2x","size":"60x60"},
+                    {"filename":"icon_167.png","idiom":"ipad","scale":"2x","size":"83.5x83.5"},
+                    {"filename":"icon_152.png","idiom":"ipad","scale":"2x","size":"76x76"},
+                    {"filename":"icon_76.png","idiom":"ipad","scale":"1x","size":"76x76"}
+                ],"info":{"author":"perry","version":1}}"#;
                 std::fs::write(iconset.join("Contents.json"), contents_json).ok();
                 std::fs::write(assets_dir.join("Contents.json"), r#"{"info":{"author":"perry","version":1}}"#).ok();
 
