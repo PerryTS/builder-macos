@@ -118,6 +118,7 @@ async fn run_build_local(args: &[String]) {
         tart_image: None, // never nest Tart
         tart_ssh_password: None,
         tart_perry_ship_path: None,
+        max_concurrent_builds: 1,
     };
 
     let request = BuildRequest {

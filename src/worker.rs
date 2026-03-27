@@ -125,6 +125,8 @@ enum WorkerMessage {
         secret: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         perry_version: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_concurrent: Option<usize>,
     },
     UpdateResult {
         success: bool,
@@ -408,6 +410,7 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
         }),
         secret: config.hub_secret.clone(),
         perry_version,
+        max_concurrent: Some(config.max_concurrent_builds),
     };
 
     write
@@ -415,22 +418,39 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
         .await
         .map_err(|e| format!("Failed to send worker_hello: {e}"))?;
 
-    tracing::info!("Connected to hub, waiting for jobs...");
+    tracing::info!(max_concurrent = config.max_concurrent_builds, "Connected to hub, waiting for jobs...");
 
-    // Track current cancellation flag
-    let cancelled = Arc::new(AtomicBool::new(false));
+    // Shared WS write channel — build tasks send messages here, writer task sends on WS
+    let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+
+    // Per-job cancellation flags
+    let cancel_flags: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let active_builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Channel for background update results
+    let (update_tx, mut update_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerMessage>();
 
     // Heartbeat state
     let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(PING_INTERVAL_SECS));
     ping_interval.tick().await; // consume the immediate first tick
     let mut last_message_at = tokio::time::Instant::now();
 
-    // Channel for background update results
-    let (update_tx, mut update_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerMessage>();
-
     loop {
         tokio::select! {
             biased;
+
+            // Drain outbound WS messages from build tasks
+            ws_msg = ws_rx.recv() => {
+                match ws_msg {
+                    Some(msg) => {
+                        if let Err(e) = write.send(msg).await {
+                            return Err(format!("Failed to send WS message: {e}"));
+                        }
+                    }
+                    None => break, // all senders dropped
+                }
+            }
 
             // Incoming WebSocket message
             msg = read.next() => {
@@ -450,10 +470,7 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
                         let _ = write.send(Message::Pong(data)).await;
                         continue;
                     }
-                    Message::Pong(_) => {
-                        // Hub responded to our ping — connection is alive
-                        continue;
-                    }
+                    Message::Pong(_) => continue,
                     Message::Close(_) => break,
                     _ => continue,
                 };
@@ -475,50 +492,67 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
                         artifact_upload_url,
                         auth_token,
                     } => {
-                        tracing::info!(job_id = %job_id, "Received job assignment");
+                        let n = active_builds.load(Ordering::Relaxed);
+                        tracing::info!(job_id = %job_id, active = n, "Received job assignment");
 
-                        // Reset cancellation flag
-                        cancelled.store(false, Ordering::Relaxed);
+                        // Create per-job cancellation flag
+                        let cancelled = Arc::new(AtomicBool::new(false));
+                        cancel_flags.lock().unwrap().insert(job_id.clone(), cancelled.clone());
 
-                        // Handle the build (this borrows read/write for progress forwarding)
-                        handle_build(
-                            config,
-                            &mut read,
-                            &mut write,
-                            &cancelled,
-                            job_id,
-                            manifest,
-                            credentials,
-                            tarball_url,
-                            artifact_upload_url,
-                            auth_token,
-                        ).await?;
+                        // Spawn build as a concurrent task
+                        let build_config = config.clone();
+                        let build_ws_tx = ws_tx.clone();
+                        let build_active = active_builds.clone();
+                        let build_cancel_flags = cancel_flags.clone();
+                        build_active.fetch_add(1, Ordering::Relaxed);
 
-                        // Reset heartbeat timer after build completes
-                        last_message_at = tokio::time::Instant::now();
+                        tokio::spawn(async move {
+                            handle_build(
+                                &build_config,
+                                &build_ws_tx,
+                                &cancelled,
+                                job_id.clone(),
+                                manifest,
+                                credentials,
+                                tarball_url,
+                                artifact_upload_url,
+                                auth_token,
+                            ).await;
+
+                            build_active.fetch_sub(1, Ordering::Relaxed);
+                            build_cancel_flags.lock().unwrap().remove(&job_id);
+                        });
                     }
 
                     HubMessage::Cancel { job_id } => {
-                        tracing::info!(job_id = %job_id, "Cancel request (no active build for this job)");
+                        if let Some(flag) = cancel_flags.lock().unwrap().get(&job_id) {
+                            tracing::info!(job_id = %job_id, "Cancelling build");
+                            flag.store(true, Ordering::Relaxed);
+                        } else {
+                            tracing::info!(job_id = %job_id, "Cancel request (no active build for this job)");
+                        }
                     }
 
                     HubMessage::UpdatePerry {} => {
-                        tracing::info!("Received update_perry request from hub");
-                        let old_version = get_perry_version(&config.perry_binary).unwrap_or_default();
-                        // Spawn update in background so the main loop continues
-                        // processing pings and hub messages during the long build.
-                        let perry_bin = config.perry_binary.clone();
-                        let update_result_tx = update_tx.clone();
-                        tokio::spawn(async move {
-                            let (success, new_version, error) = run_perry_update(&perry_bin).await;
-                            let result = WorkerMessage::UpdateResult {
-                                success,
-                                old_version,
-                                new_version,
-                                error,
-                            };
-                            let _ = update_result_tx.send(result);
-                        });
+                        let n = active_builds.load(Ordering::Relaxed);
+                        if n > 0 {
+                            tracing::info!("Deferring update_perry: {n} builds active");
+                        } else {
+                            tracing::info!("Received update_perry request from hub");
+                            let old_version = get_perry_version(&config.perry_binary).unwrap_or_default();
+                            let perry_bin = config.perry_binary.clone();
+                            let update_result_tx = update_tx.clone();
+                            tokio::spawn(async move {
+                                let (success, new_version, error) = run_perry_update(&perry_bin).await;
+                                let result = WorkerMessage::UpdateResult {
+                                    success,
+                                    old_version,
+                                    new_version,
+                                    error,
+                                };
+                                let _ = update_result_tx.send(result);
+                            });
+                        }
                     }
                 }
             }
@@ -550,11 +584,11 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// Handle a single build job, forwarding progress and listening for cancel messages.
+/// Handle a single build job. Runs as a spawned task, sends all WS messages
+/// through the shared `ws_tx` channel.
 async fn handle_build(
     config: &WorkerConfig,
-    read: &mut futures::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
-    write: &mut futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
+    ws_tx: &tokio::sync::mpsc::UnboundedSender<Message>,
     cancelled: &Arc<AtomicBool>,
     job_id: String,
     manifest: serde_json::Value,
@@ -562,7 +596,7 @@ async fn handle_build(
     tarball_url: String,
     artifact_upload_url: Option<String>,
     auth_token: Option<String>,
-) -> Result<(), String> {
+) {
     // Parse manifest and credentials
     let manifest: crate::queue::job::BuildManifest =
         match serde_json::from_value(manifest) {
@@ -570,9 +604,9 @@ async fn handle_build(
             Err(e) => {
                 let err_msg = format!("Invalid manifest: {e}");
                 tracing::error!("{err_msg}");
-                send_error(write, &job_id, &err_msg).await;
-                send_complete(write, &job_id, false, 0.0).await;
-                return Ok(());
+                send_error(ws_tx, &job_id, &err_msg);
+                send_complete(ws_tx, &job_id, false, 0.0);
+                return;
             }
         };
 
@@ -582,9 +616,9 @@ async fn handle_build(
             Err(e) => {
                 let err_msg = format!("Invalid credentials: {e}");
                 tracing::error!("{err_msg}");
-                send_error(write, &job_id, &err_msg).await;
-                send_complete(write, &job_id, false, 0.0).await;
-                return Ok(());
+                send_error(ws_tx, &job_id, &err_msg);
+                send_complete(ws_tx, &job_id, false, 0.0);
+                return;
             }
         };
 
@@ -594,9 +628,9 @@ async fn handle_build(
         Err(e) => {
             let err_msg = format!("Failed to download tarball: {e}");
             tracing::error!(job_id = %job_id, "{err_msg}");
-            send_error(write, &job_id, &err_msg).await;
-            send_complete(write, &job_id, false, 0.0).await;
-            return Ok(());
+            send_error(ws_tx, &job_id, &err_msg);
+            send_complete(ws_tx, &job_id, false, 0.0);
+            return;
         }
     };
 
@@ -612,13 +646,12 @@ async fn handle_build(
     // Create progress sender that forwards to hub WS
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
 
-    // Run build and forward progress
+    // Run build in a subtask
     let build_config = config.clone();
     let cancelled_for_build = cancelled.clone();
     let (build_result_tx, build_result_rx) =
         tokio::sync::oneshot::channel::<Result<PathBuf, String>>();
 
-    // Spawn build task
     tokio::spawn(async move {
         let result = pipeline::execute_build(
             &request,
@@ -627,7 +660,6 @@ async fn handle_build(
             progress_tx,
         )
         .await;
-        // Clean up downloaded tarball
         std::fs::remove_file(&request.tarball_path).ok();
         let _ = build_result_tx.send(result);
     });
@@ -643,16 +675,12 @@ async fn handle_build(
         tokio::select! {
             biased;
 
-            // Build completion
             result = &mut build_result_rx, if !build_done => {
                 build_result = result.ok();
                 build_done = true;
-                if progress_done {
-                    break;
-                }
+                if progress_done { break; }
             }
 
-            // Forward progress to hub
             progress = progress_rx.recv(), if !progress_done => {
                 match progress {
                     Some(msg) => {
@@ -661,37 +689,12 @@ async fn handle_build(
                             map.insert("job_id".into(), serde_json::Value::String(job_id.clone()));
                         }
                         let json = serde_json::to_string(&json_val).unwrap();
-                        let _ = write.send(Message::Text(json.into())).await;
+                        let _ = ws_tx.send(Message::Text(json.into()));
                     }
                     None => {
                         progress_done = true;
-                        if build_done {
-                            break;
-                        }
+                        if build_done { break; }
                     }
-                }
-            }
-
-            // Check for hub messages (cancel, ping)
-            ws_msg = read.next() => {
-                match ws_msg {
-                    Some(Ok(Message::Text(text))) => {
-                        if let Ok(hub_msg) = serde_json::from_str::<HubMessage>(&text) {
-                            if let HubMessage::Cancel { job_id: cancel_id } = hub_msg {
-                                if cancel_id == job_id {
-                                    tracing::info!(job_id = %job_id, "Cancelling build");
-                                    cancelled.store(true, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                    }
-                    Some(Ok(Message::Ping(data))) => {
-                        let _ = write.send(Message::Pong(data)).await;
-                    }
-                    Some(Ok(Message::Close(_))) | None => {
-                        return Err("Hub disconnected during build".into());
-                    }
-                    _ => {}
                 }
             }
         }
@@ -704,7 +707,7 @@ async fn handle_build(
             map.insert("job_id".into(), serde_json::Value::String(job_id.clone()));
         }
         let json = serde_json::to_string(&json_val).unwrap();
-        let _ = write.send(Message::Text(json.into())).await;
+        let _ = ws_tx.send(Message::Text(json.into()));
     }
 
     let duration_secs = start.elapsed().as_secs_f64();
@@ -735,7 +738,7 @@ async fn handle_build(
                             "message": format!("Artifact upload failed: {e}"),
                         }))
                         .unwrap();
-                        let _ = write.send(Message::Text(error_msg.into())).await;
+                        let _ = ws_tx.send(Message::Text(error_msg.into()));
                     }
                 }
             } else {
@@ -749,7 +752,7 @@ async fn handle_build(
                     "size": size,
                 }))
                 .unwrap();
-                let _ = write.send(Message::Text(artifact_msg.into())).await;
+                let _ = ws_tx.send(Message::Text(artifact_msg.into()));
             }
 
             std::fs::remove_file(&artifact_path).ok();
@@ -766,45 +769,44 @@ async fn handle_build(
                 }]
             }))
             .unwrap();
-            let _ = write.send(Message::Text(complete_msg.into())).await;
+            let _ = ws_tx.send(Message::Text(complete_msg.into()));
 
             tracing::info!(job_id = %job_id, "Build completed in {:.1}s", duration_secs);
         }
         Some(Err(err_msg)) => {
             tracing::error!(job_id = %job_id, error = %err_msg, "Build failed");
-            send_error(write, &job_id, &err_msg).await;
-            send_complete(write, &job_id, false, duration_secs).await;
+            send_error(ws_tx, &job_id, &err_msg);
+            send_complete(ws_tx, &job_id, false, duration_secs);
         }
         None => {
             tracing::error!(job_id = %job_id, "Build task panicked");
-            send_complete(write, &job_id, false, duration_secs).await;
+            send_complete(ws_tx, &job_id, false, duration_secs);
         }
     }
-
-    Ok(())
 }
 
-async fn send_error(
-    write: &mut futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
+fn send_error(
+    ws_tx: &tokio::sync::mpsc::UnboundedSender<Message>,
     job_id: &str,
     message: &str,
 ) {
-    let error_json = serde_json::to_string(&ServerMessage::Error {
-        code: ErrorCode::InternalError,
-        message: message.to_string(),
-        stage: None,
-    })
+    let json = serde_json::to_string(&serde_json::json!({
+        "type": "error",
+        "job_id": job_id,
+        "code": "INTERNAL_ERROR",
+        "message": message,
+    }))
     .unwrap();
-    let _ = write.send(Message::Text(error_json.into())).await;
+    let _ = ws_tx.send(Message::Text(json.into()));
 }
 
-async fn send_complete(
-    write: &mut futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
+fn send_complete(
+    ws_tx: &tokio::sync::mpsc::UnboundedSender<Message>,
     job_id: &str,
     success: bool,
     duration_secs: f64,
 ) {
-    let complete_json = serde_json::to_string(&serde_json::json!({
+    let json = serde_json::to_string(&serde_json::json!({
         "type": "complete",
         "job_id": job_id,
         "success": success,
@@ -812,7 +814,7 @@ async fn send_complete(
         "artifacts": []
     }))
     .unwrap();
-    let _ = write.send(Message::Text(complete_json.into())).await;
+    let _ = ws_tx.send(Message::Text(json.into()));
 }
 
 fn compute_sha256(path: &PathBuf) -> Result<String, String> {

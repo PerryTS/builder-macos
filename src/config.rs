@@ -17,6 +17,8 @@ pub struct WorkerConfig {
     /// Path to perry-ship binary inside the Tart VM.
     /// Defaults to "/Users/admin/bin/perry-ship".
     pub tart_perry_ship_path: Option<String>,
+    /// Max concurrent builds (default 2). Each build runs in its own Tart VM.
+    pub max_concurrent_builds: usize,
 }
 
 impl WorkerConfig {
@@ -38,6 +40,10 @@ impl WorkerConfig {
             tart_image: env::var("PERRY_TART_IMAGE").ok(),
             tart_ssh_password: env::var("PERRY_TART_SSH_PASSWORD").ok(),
             tart_perry_ship_path: env::var("PERRY_TART_PERRY_SHIP_PATH").ok(),
+            max_concurrent_builds: env::var("PERRY_MAX_CONCURRENT_BUILDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2),
         }
     }
 
