@@ -46,12 +46,35 @@ cargo build --release
 ./target/release/perry-ship
 ```
 
+## Concurrent Builds
+The worker supports running multiple builds in parallel (default 2, configurable
+via `PERRY_MAX_CONCURRENT_BUILDS`). Each build runs in its own Tart VM clone.
+Builds are spawned as tokio tasks with a shared WS write channel. The
+`worker_hello` message advertises `max_concurrent` to the hub for slot-based dispatch.
+
+## Code Signing
+- **macOS/iOS**: Uses `rcodesign` (Rust-based, no macOS Security.framework dependency).
+  Accepts `.p12` directly — no Keychain import needed. Falls back to Apple's `codesign`
+  for ad-hoc signing.
+- **macOS App Store**: Embeds provisioning profile as `Contents/embedded.provisionprofile`
+  (required for TestFlight). Profile passed via `provisioning_profile_base64` in credentials.
+- **Notarization**: Sign app → notarize DMG → staple → recreate DMG → sign DMG → notarize → staple.
+
+## Environment Variables
+- `PERRY_HUB_URL` — Hub WebSocket URL (default: `wss://hub.perryts.com/ws`)
+- `PERRY_HUB_SECRET` — Auth secret for hub connection
+- `PERRY_WORKER_NAME` — Worker name (default: hostname)
+- `PERRY_MAX_CONCURRENT_BUILDS` — Max parallel builds (default: 2)
+- `PERRY_TART_IMAGE` — Golden Tart VM image name
+- `PERRY_TART_SSH_PASSWORD` — SSH password for Tart VMs
+
 ## How It Works
-1. Worker connects to hub WebSocket, sends `worker_hello` with capabilities
-2. Hub assigns jobs → worker receives `job_assign` with manifest + tarball path
-3. Worker runs build pipeline: compile → package → sign → (optional) publish
-4. Progress/logs streamed back to hub in real-time via WS
-5. Finished artifacts registered with hub for CLI download
+1. Worker connects to hub WebSocket, sends `worker_hello` with capabilities + `max_concurrent`
+2. Hub assigns jobs → worker receives `job_assign`, spawns build as async task
+3. Each build: clone golden VM → boot → SCP tarball → compile → package → sign → upload artifact
+4. Progress/logs streamed back to hub in real-time via shared WS channel
+5. Multiple builds run concurrently in separate VMs
+6. VM cleaned up after each build
 
 ## Related Repos
 - [hub](https://github.com/PerryTS/hub) — the hub server this worker connects to
