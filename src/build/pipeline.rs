@@ -993,7 +993,7 @@ async fn run_sign_only_pipeline(
         let extract_dir = tmpdir.join("precompiled");
         std::fs::create_dir_all(&extract_dir)
             .map_err(|e| format!("Failed to create extract dir: {e}"))?;
-        extract_tarball(&request.tarball_path, &extract_dir)?;
+        extract_archive(&request.tarball_path, &extract_dir)?;
         send_progress(progress, StageName::Extracting, 100, None);
 
         // Find the .app bundle in the extracted content
@@ -1114,6 +1114,40 @@ async fn run_sign_only_pipeline(
 
     cleanup_tmpdir(&tmpdir);
     result
+}
+
+/// Extract an archive — auto-detects zip (.ipa) vs tar.gz format
+fn extract_archive(archive_path: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    let data = std::fs::read(archive_path)
+        .map_err(|e| format!("Failed to read archive: {e}"))?;
+
+    // Detect format by magic bytes: zip starts with PK (0x50 0x4B), gzip with 0x1F 0x8B
+    if data.len() >= 2 && data[0] == 0x50 && data[1] == 0x4B {
+        // ZIP format (.ipa)
+        let cursor = std::io::Cursor::new(data);
+        let mut archive = zip::ZipArchive::new(cursor)
+            .map_err(|e| format!("Failed to open zip: {e}"))?;
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i)
+                .map_err(|e| format!("Failed to read zip entry: {e}"))?;
+            let outpath = dest.join(file.mangled_name());
+            if file.is_dir() {
+                std::fs::create_dir_all(&outpath).ok();
+            } else {
+                if let Some(parent) = outpath.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                let mut outfile = std::fs::File::create(&outpath)
+                    .map_err(|e| format!("Failed to create file: {e}"))?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| format!("Failed to extract file: {e}"))?;
+            }
+        }
+        Ok(())
+    } else {
+        // Assume tar.gz
+        extract_tarball(archive_path, dest)
+    }
 }
 
 /// Find a .app bundle in the extracted directory (searches recursively)
