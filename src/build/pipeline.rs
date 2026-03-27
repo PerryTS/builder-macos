@@ -1041,7 +1041,10 @@ async fn run_sign_only_pipeline(
         }
 
         if let Some(ref p12) = p12_path {
-            let entitlements_path = if request.manifest.entitlements.is_some() {
+            // For iOS, don't pass macOS entitlements — iOS entitlements come from
+            // the provisioning profile. macOS entitlements (com.apple.security.*)
+            // cause App Store rejection on iOS.
+            let entitlements_path = if matches!(target, BuildTarget::MacOsSign) && request.manifest.entitlements.is_some() {
                 let p = tmpdir.join("entitlements.plist");
                 macos::write_entitlements_plist(&request.manifest, &p)?;
                 Some(p)
