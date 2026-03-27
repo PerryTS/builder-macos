@@ -1043,23 +1043,14 @@ async fn run_sign_only_pipeline(
                 match actool_result {
                     Ok(o) if o.status.success() => {
                         tracing::info!("Compiled iOS asset catalog (Assets.car)");
-                        // Merge partial Info.plist from actool into the app's Info.plist
-                        // This adds CFBundleIconName and other asset catalog keys
-                        if partial_plist.exists() {
-                            let merge_result = tokio::process::Command::new("/usr/libexec/PlistBuddy")
-                                .args(["-c", "Merge", partial_plist.to_str().unwrap_or(""),
-                                       app_path.join("Info.plist").to_str().unwrap_or("")])
-                                .output()
-                                .await;
-                            // Fallback: just set CFBundleIconName directly
-                            if merge_result.is_err() || !merge_result.as_ref().unwrap().status.success() {
-                                let _ = tokio::process::Command::new("/usr/libexec/PlistBuddy")
-                                    .args(["-c", "Add :CFBundleIconName string AppIcon",
-                                           app_path.join("Info.plist").to_str().unwrap_or("")])
-                                    .output()
-                                    .await;
-                            }
-                        }
+                        // Add CFBundleIconName to Info.plist (required for asset catalog icons)
+                        let plist_path = app_path.join("Info.plist");
+                        let _ = tokio::process::Command::new("/usr/libexec/PlistBuddy")
+                            .args(["-c", "Add :CFBundleIconName string AppIcon",
+                                   plist_path.to_str().unwrap_or("")])
+                            .output()
+                            .await;
+                        tracing::info!("Added CFBundleIconName to Info.plist");
                     }
                     Ok(o) => {
                         tracing::warn!("actool failed (non-fatal): {}", String::from_utf8_lossy(&o.stderr));
