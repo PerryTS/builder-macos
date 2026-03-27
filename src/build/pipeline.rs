@@ -1041,10 +1041,34 @@ async fn run_sign_only_pipeline(
         }
 
         if let Some(ref p12) = p12_path {
-            // For iOS, don't pass macOS entitlements — iOS entitlements come from
-            // the provisioning profile. macOS entitlements (com.apple.security.*)
-            // cause App Store rejection on iOS.
-            let entitlements_path = if matches!(target, BuildTarget::MacOsSign) && request.manifest.entitlements.is_some() {
+            // Generate platform-appropriate entitlements
+            let entitlements_path = if matches!(target, BuildTarget::IosSign) {
+                // iOS needs minimal entitlements — just get-task-allow (for dev) and app identifier
+                // The provisioning profile handles most entitlements on iOS
+                let bundle_id = if request.manifest.bundle_id.is_empty() {
+                    "com.example.app"
+                } else {
+                    &request.manifest.bundle_id
+                };
+                let p = tmpdir.join("entitlements.plist");
+                let plist = format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>application-identifier</key>
+    <string>{team_id}.{bundle_id}</string>
+    <key>com.apple.developer.team-identifier</key>
+    <string>{team_id}</string>
+</dict>
+</plist>"#,
+                    team_id = request.credentials.apple_team_id.as_deref().unwrap_or("TEAMID"),
+                    bundle_id = bundle_id,
+                );
+                std::fs::write(&p, plist)
+                    .map_err(|e| format!("Failed to write iOS entitlements: {e}"))?;
+                Some(p)
+            } else if matches!(target, BuildTarget::MacOsSign) && request.manifest.entitlements.is_some() {
                 let p = tmpdir.join("entitlements.plist");
                 macos::write_entitlements_plist(&request.manifest, &p)?;
                 Some(p)
