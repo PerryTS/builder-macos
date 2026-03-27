@@ -1016,6 +1016,42 @@ async fn run_sign_only_pipeline(
 
         let identity = request.credentials.apple_signing_identity.as_deref();
 
+        // Compile icon asset catalog on macOS (xcrun actool is macOS-only)
+        if matches!(target, BuildTarget::IosSign) {
+            let icon_1024 = app_path.join("Icon-1024.png");
+            if icon_1024.exists() {
+                let assets_dir = tmpdir.join("Assets.xcassets");
+                let iconset = assets_dir.join("AppIcon.appiconset");
+                std::fs::create_dir_all(&iconset).ok();
+                // Copy icon as the source
+                std::fs::copy(&icon_1024, iconset.join("icon_1024x1024.png")).ok();
+                // Generate Contents.json for asset catalog
+                let contents_json = r#"{"images":[{"filename":"icon_1024x1024.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"perry","version":1}}"#;
+                std::fs::write(iconset.join("Contents.json"), contents_json).ok();
+                std::fs::write(assets_dir.join("Contents.json"), r#"{"info":{"author":"perry","version":1}}"#).ok();
+
+                // Compile asset catalog using xcrun actool
+                let actool_result = tokio::process::Command::new("xcrun")
+                    .args(["actool", "--compile", app_path.to_str().unwrap_or(""),
+                           "--platform", "iphoneos", "--minimum-deployment-target", "17.0",
+                           "--app-icon", "AppIcon", "--output-partial-info-plist", "/dev/null"])
+                    .arg(assets_dir.to_str().unwrap_or(""))
+                    .output()
+                    .await;
+                match actool_result {
+                    Ok(o) if o.status.success() => {
+                        tracing::info!("Compiled iOS asset catalog (Assets.car)");
+                    }
+                    Ok(o) => {
+                        tracing::warn!("actool failed (non-fatal): {}", String::from_utf8_lossy(&o.stderr));
+                    }
+                    Err(e) => {
+                        tracing::warn!("actool not available (non-fatal): {e}");
+                    }
+                }
+            }
+        }
+
         // Embed provisioning profile for iOS (required for App Store / TestFlight)
         if matches!(target, BuildTarget::IosSign) {
             if let Some(ref b64) = request.credentials.provisioning_profile_base64 {
