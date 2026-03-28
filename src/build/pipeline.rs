@@ -1044,12 +1044,34 @@ async fn run_sign_only_pipeline(
                 let iconset = assets_dir.join("AppIcon.appiconset");
                 std::fs::create_dir_all(&iconset).ok();
 
-                // Copy 1024px source icon for asset catalog (actool auto-generates all sizes)
-                std::fs::copy(&icon_path, iconset.join("icon_1024.png")).ok();
+                // Generate all required icon sizes using sips (macOS native)
+                let icon_sizes: &[(u32, &str, &str, &str)] = &[
+                    (1024, "icon_1024.png", "ios-marketing", "1x"),
+                    (180, "icon_60_3x.png", "iphone", "3x"),
+                    (120, "icon_60_2x.png", "iphone", "2x"),
+                    (167, "icon_83.5_2x.png", "ipad", "2x"),
+                    (152, "icon_76_2x.png", "ipad", "2x"),
+                    (76, "icon_76_1x.png", "ipad", "1x"),
+                ];
+                for (size, name, _, _) in icon_sizes {
+                    let dest = iconset.join(name);
+                    std::fs::copy(&icon_path, &dest).ok();
+                    if *size != 1024 {
+                        let _ = std::process::Command::new("sips")
+                            .args(["-z", &size.to_string(), &size.to_string()])
+                            .arg(&dest)
+                            .output();
+                    }
+                }
 
-                // Modern iOS asset catalog: single 1024x1024 universal icon.
-                // actool auto-generates all required device sizes from it.
-                let contents_json = r#"{"images":[{"filename":"icon_1024.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}"#;
+                let contents_json = r#"{"images":[
+                    {"filename":"icon_1024.png","idiom":"ios-marketing","scale":"1x","size":"1024x1024"},
+                    {"filename":"icon_60_3x.png","idiom":"iphone","scale":"3x","size":"60x60"},
+                    {"filename":"icon_60_2x.png","idiom":"iphone","scale":"2x","size":"60x60"},
+                    {"filename":"icon_83.5_2x.png","idiom":"ipad","scale":"2x","size":"83.5x83.5"},
+                    {"filename":"icon_76_2x.png","idiom":"ipad","scale":"2x","size":"76x76"},
+                    {"filename":"icon_76_1x.png","idiom":"ipad","scale":"1x","size":"76x76"}
+                ],"info":{"author":"xcode","version":1}}"#;
                 std::fs::write(iconset.join("Contents.json"), contents_json).ok();
                 std::fs::write(assets_dir.join("Contents.json"), r#"{"info":{"author":"perry","version":1}}"#).ok();
 
