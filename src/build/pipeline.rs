@@ -1044,21 +1044,21 @@ async fn run_sign_only_pipeline(
                 let iconset = assets_dir.join("AppIcon.appiconset");
                 std::fs::create_dir_all(&iconset).ok();
 
-                // Generate all required icon sizes from source
-                if let Ok(img) = image::open(&icon_path) {
-                    for (size, name) in &[
-                        (1024u32, "icon_1024.png"),
-                        (180, "icon_180.png"),   // iPhone @3x
-                        (120, "icon_120.png"),   // iPhone @2x
-                        (167, "icon_167.png"),   // iPad Pro @2x
-                        (152, "icon_152.png"),   // iPad @2x
-                        (76, "icon_76.png"),     // iPad @1x
-                    ] {
-                        let resized = img.resize_exact(*size, *size, image::imageops::FilterType::Lanczos3);
-                        resized.save(iconset.join(name)).ok();
-                        // Also copy fallback PNGs into .app bundle for older iOS
-                        resized.save(app_path.join(format!("Icon-{size}.png"))).ok();
-                    }
+                // Generate all required icon sizes using sips (macOS native, reliable PNG output)
+                for (size, name) in &[
+                    (1024u32, "icon_1024.png"),
+                    (180, "icon_180.png"),
+                    (120, "icon_120.png"),
+                    (167, "icon_167.png"),
+                    (152, "icon_152.png"),
+                    (76, "icon_76.png"),
+                ] {
+                    let dest = iconset.join(name);
+                    std::fs::copy(&icon_path, &dest).ok();
+                    let _ = std::process::Command::new("sips")
+                        .args(["-z", &size.to_string(), &size.to_string()])
+                        .arg(&dest)
+                        .output();
                 }
 
                 let contents_json = r#"{"images":[
