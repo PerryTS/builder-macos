@@ -1088,14 +1088,31 @@ async fn run_sign_only_pipeline(
                 match actool_result {
                     Ok(o) if o.status.success() => {
                         tracing::info!("Compiled iOS asset catalog (Assets.car)");
-                        // Add CFBundleIconName to Info.plist (required for asset catalog icons)
+                        // Merge actool's partial plist into the app's Info.plist
                         let plist_path = app_path.join("Info.plist");
-                        let _ = tokio::process::Command::new("/usr/libexec/PlistBuddy")
-                            .args(["-c", "Add :CFBundleIconName string AppIcon",
-                                   plist_path.to_str().unwrap_or("")])
+                        if partial_plist.exists() {
+                            // Use plutil to merge
+                            let merge = tokio::process::Command::new("plutil")
+                                .args(["-replace", "CFBundleIconName", "-string", "AppIcon"])
+                                .arg(&plist_path)
+                                .output()
+                                .await;
+                            if let Ok(ref o) = merge { if !o.status.success() {
+                                tracing::warn!("plutil replace failed, trying PlistBuddy");
+                                let _ = tokio::process::Command::new("/usr/libexec/PlistBuddy")
+                                    .args(["-c", "Set :CFBundleIconName AppIcon",
+                                           plist_path.to_str().unwrap_or("")])
+                                    .output()
+                                    .await;
+                            }}
+                        }
+                        // Convert Info.plist to binary format (Apple prefers binary plist)
+                        let _ = tokio::process::Command::new("plutil")
+                            .args(["-convert", "binary1"])
+                            .arg(&plist_path)
                             .output()
                             .await;
-                        tracing::info!("Added CFBundleIconName to Info.plist");
+                        tracing::info!("Merged asset catalog info into Info.plist");
                     }
                     Ok(o) => {
                         tracing::warn!("actool failed (non-fatal): {}", String::from_utf8_lossy(&o.stderr));
