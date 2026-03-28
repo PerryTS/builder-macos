@@ -420,8 +420,20 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
 
     tracing::info!(max_concurrent = config.max_concurrent_builds, "Connected to hub, waiting for jobs...");
 
-    // Shared WS write channel — build tasks send messages here, writer task sends on WS
+    // Shared WS write channel — build tasks send messages here
     let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+
+    // Spawn dedicated WS writer task — prevents WS backpressure from blocking main loop
+    let ws_writer_error = Arc::new(std::sync::Mutex::new(None::<String>));
+    let ws_writer_err_clone = ws_writer_error.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = ws_rx.recv().await {
+            if let Err(e) = write.send(msg).await {
+                *ws_writer_err_clone.lock().unwrap() = Some(format!("WS write failed: {e}"));
+                break;
+            }
+        }
+    });
 
     // Per-job cancellation flags
     let cancel_flags: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>> =
@@ -437,20 +449,13 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
     let mut last_message_at = tokio::time::Instant::now();
 
     loop {
+        // Check if WS writer died
+        if let Some(err) = ws_writer_error.lock().unwrap().take() {
+            return Err(err);
+        }
+
         tokio::select! {
             biased;
-
-            // Drain outbound WS messages from build tasks
-            ws_msg = ws_rx.recv() => {
-                match ws_msg {
-                    Some(msg) => {
-                        if let Err(e) = write.send(msg).await {
-                            return Err(format!("Failed to send WS message: {e}"));
-                        }
-                    }
-                    None => break, // all senders dropped
-                }
-            }
 
             // Incoming WebSocket message
             msg = read.next() => {
@@ -467,7 +472,7 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
                 let text = match msg {
                     Message::Text(t) => t,
                     Message::Ping(data) => {
-                        let _ = write.send(Message::Pong(data)).await;
+                        let _ = ws_tx.send(Message::Pong(data));
                         continue;
                     }
                     Message::Pong(_) => continue,
@@ -560,7 +565,7 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
             // Handle background update results
             result = update_rx.recv() => {
                 if let Some(result) = result {
-                    let _ = write.send(Message::Text(serde_json::to_string(&result).unwrap().into())).await;
+                    let _ = ws_tx.send(Message::Text(serde_json::to_string(&result).unwrap().into()));
                 }
             }
 
@@ -574,7 +579,7 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
                     ));
                 }
 
-                if let Err(e) = write.send(Message::Ping(vec![].into())).await {
+                if let Err(e) = ws_tx.send(Message::Ping(vec![].into())) {
                     return Err(format!("Failed to send ping: {e}"));
                 }
             }
