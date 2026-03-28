@@ -999,6 +999,17 @@ async fn run_sign_only_pipeline(
         // Find the .app bundle in the extracted content
         let app_path = find_app_bundle(&extract_dir)?;
         tracing::info!("Found precompiled .app: {}", app_path.display());
+        // Log Info.plist content for debugging
+        let plist_path = app_path.join("Info.plist");
+        if plist_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&plist_path) {
+                let has_icon_name = content.contains("CFBundleIconName");
+                let has_dt_platform = content.contains("DTPlatformName");
+                tracing::info!("Info.plist: CFBundleIconName={has_icon_name} DTPlatformName={has_dt_platform} size={}", content.len());
+            }
+        } else {
+            tracing::warn!("No Info.plist found in .app!");
+        }
 
         // Stage 2: Sign with rcodesign
         send_stage(progress, StageName::Signing, "Signing precompiled bundle");
