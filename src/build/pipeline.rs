@@ -1055,12 +1055,12 @@ async fn run_sign_only_pipeline(
                 ];
                 for (size, name, _, _) in icon_sizes {
                     let dest = iconset.join(name);
-                    std::fs::copy(&icon_path, &dest).ok();
-                    if *size != 1024 {
-                        let _ = std::process::Command::new("sips")
-                            .args(["-z", &size.to_string(), &size.to_string()])
-                            .arg(&dest)
-                            .output();
+                    // Use image crate to resize AND strip alpha (flatten to RGB)
+                    if let Ok(img) = image::open(&icon_path) {
+                        let resized = img.resize_exact(*size, *size, image::imageops::FilterType::Lanczos3);
+                        // Convert to RGB (strips alpha channel)
+                        let rgb = resized.to_rgb8();
+                        rgb.save(&dest).ok();
                     }
                 }
 
