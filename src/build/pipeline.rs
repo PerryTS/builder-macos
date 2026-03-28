@@ -1089,30 +1089,48 @@ async fn run_sign_only_pipeline(
                     Ok(o) if o.status.success() => {
                         tracing::info!("Compiled iOS asset catalog (Assets.car)");
                         // Merge actool's partial plist into the app's Info.plist
+                        // actool generates CFBundleIcons with the proper structure
                         let plist_path = app_path.join("Info.plist");
                         if partial_plist.exists() {
-                            // Use plutil to merge
-                            let merge = tokio::process::Command::new("plutil")
-                                .args(["-replace", "CFBundleIconName", "-string", "AppIcon"])
-                                .arg(&plist_path)
+                            let _ = tokio::process::Command::new("/usr/libexec/PlistBuddy")
+                                .args(["-c", &format!("Merge {} :CFBundleIcons", partial_plist.to_str().unwrap_or("")),
+                                       plist_path.to_str().unwrap_or("")])
                                 .output()
                                 .await;
-                            if let Ok(ref o) = merge { if !o.status.success() {
-                                tracing::warn!("plutil replace failed, trying PlistBuddy");
-                                let _ = tokio::process::Command::new("/usr/libexec/PlistBuddy")
-                                    .args(["-c", "Set :CFBundleIconName AppIcon",
-                                           plist_path.to_str().unwrap_or("")])
-                                    .output()
-                                    .await;
-                            }}
+                            // Simpler approach: just replace the relevant keys from partial plist
+                            // Read partial plist and apply each key
+                            if let Ok(partial_content) = std::fs::read_to_string(&partial_plist) {
+                                if partial_content.contains("CFBundleIcons") {
+                                    // Delete existing icon keys and re-add from partial
+                                    for key in &["CFBundleIcons", "CFBundleIcons~ipad"] {
+                                        let _ = tokio::process::Command::new("/usr/libexec/PlistBuddy")
+                                            .args(["-c", &format!("Delete :{key}"),
+                                                   plist_path.to_str().unwrap_or("")])
+                                            .output()
+                                            .await;
+                                    }
+                                    // Merge the partial plist
+                                    let _ = tokio::process::Command::new("/usr/libexec/PlistBuddy")
+                                        .args(["-c", &format!("Merge {}", partial_plist.to_str().unwrap_or("")),
+                                               plist_path.to_str().unwrap_or("")])
+                                        .output()
+                                        .await;
+                                }
+                            }
                         }
-                        // Convert Info.plist to binary format (Apple prefers binary plist)
+                        // Set CFBundleIconName at root level too
+                        let _ = tokio::process::Command::new("plutil")
+                            .args(["-replace", "CFBundleIconName", "-string", "AppIcon"])
+                            .arg(&plist_path)
+                            .output()
+                            .await;
+                        // Convert to binary plist
                         let _ = tokio::process::Command::new("plutil")
                             .args(["-convert", "binary1"])
                             .arg(&plist_path)
                             .output()
                             .await;
-                        tracing::info!("Merged asset catalog info into Info.plist");
+                        tracing::info!("Merged actool partial plist into Info.plist");
                     }
                     Ok(o) => {
                         tracing::warn!("actool failed (non-fatal): {}", String::from_utf8_lossy(&o.stderr));
