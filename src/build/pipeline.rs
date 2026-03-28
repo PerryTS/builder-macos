@@ -999,7 +999,11 @@ async fn run_sign_only_pipeline(
         // Find the .app bundle in the extracted content
         let app_path = find_app_bundle(&extract_dir)?;
         tracing::info!("Found precompiled .app: {}", app_path.display());
-        // Log Info.plist content for debugging
+        // Log .app contents for debugging
+        if let Ok(entries) = std::fs::read_dir(&app_path) {
+            let files: Vec<String> = entries.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).collect();
+            tracing::info!(".app contents: {:?}", files);
+        }
         let plist_path = app_path.join("Info.plist");
         if plist_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&plist_path) {
