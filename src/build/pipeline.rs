@@ -1178,6 +1178,12 @@ async fn run_sign_only_pipeline(
 
         match target {
             BuildTarget::IosSign => {
+                // Log .app contents before .ipa creation
+                if let Ok(entries) = std::fs::read_dir(&app_path) {
+                    let files: Vec<String> = entries.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).collect();
+                    tracing::info!("Pre-ipa .app contents: {:?}", files);
+                }
+
                 // Stage 3: Create signed .ipa
                 send_stage(progress, StageName::Packaging, "Creating signed .ipa");
                 check_cancelled(cancelled)?;
