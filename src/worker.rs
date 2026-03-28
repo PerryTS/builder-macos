@@ -224,7 +224,7 @@ async fn run_perry_update(perry_binary: &str) -> (bool, String, Option<String>) 
     tracing::info!(ip = %vm_ip, "Update VM booted");
 
     let ssh_base = format!(
-        "{} -p '{}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 admin@{}",
+        "{} -p '{}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 admin@{}",
         sshpass, ssh_password, vm_ip
     );
 
@@ -232,7 +232,7 @@ async fn run_perry_update(perry_binary: &str) -> (bool, String, Option<String>) 
     // Build each target separately to keep memory usage reasonable.
     // Use cp to temp + mv to handle hardlinked same-file cases.
     let update_script = concat!(
-        "set -e; cd ~/perry; find .git -name '*.lock' -delete 2>/dev/null; rm -f .git/packed-refs; rm -rf .git/refs/remotes; git checkout -- . 2>/dev/null; git clean -fd 2>/dev/null; git fetch origin; git checkout -B main origin/main; ",
+        "set -e; cd ~/perry; find .git -name \"*.lock\" -delete 2>/dev/null || true; rm -f .git/packed-refs; rm -rf .git/refs/remotes; git checkout -- . 2>/dev/null || true; git clean -fd 2>/dev/null || true; git fetch origin; git checkout -B main origin/main; ",
         "cargo build --release -p perry; ",
         "cargo build --release -p perry-runtime -p perry-stdlib; ",
         "cargo build --release -p perry-ui-macos; ",
@@ -248,8 +248,8 @@ async fn run_perry_update(perry_binary: &str) -> (bool, String, Option<String>) 
         "cp target/aarch64-apple-ios/release/libperry_ui_ios.a ~/bin/libperry_ui_ios.a.tmp && mv -f ~/bin/libperry_ui_ios.a.tmp ~/bin/libperry_ui_ios.a; ",
         // Install Apple WWDR intermediate CAs (G3, G6) so codesign can validate cert chains.
         // These get lost when the golden image is rebuilt from a clone.
-        "curl -sL https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer -o /tmp/wwdr-g3.cer && sudo security add-certificates -k /Library/Keychains/System.keychain /tmp/wwdr-g3.cer 2>/dev/null; ",
-        "curl -sL https://www.apple.com/certificateauthority/AppleWWDRCAG6.cer -o /tmp/wwdr-g6.cer && sudo security add-certificates -k /Library/Keychains/System.keychain /tmp/wwdr-g6.cer 2>/dev/null; ",
+        "curl -sL https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer -o /tmp/wwdr-g3.cer && sudo security add-certificates -k /Library/Keychains/System.keychain /tmp/wwdr-g3.cer 2>/dev/null || true; ",
+        "curl -sL https://www.apple.com/certificateauthority/AppleWWDRCAG6.cer -o /tmp/wwdr-g6.cer && sudo security add-certificates -k /Library/Keychains/System.keychain /tmp/wwdr-g6.cer 2>/dev/null || true; ",
         "rm -f /tmp/wwdr-g3.cer /tmp/wwdr-g6.cer; ",
         "~/bin/perry --version"
     );
