@@ -1130,6 +1130,21 @@ async fn run_sign_only_pipeline(
                             .arg(&plist_path)
                             .output()
                             .await;
+                        // Verify: dump plist to check CFBundleIconName
+                        let verify = tokio::process::Command::new("plutil")
+                            .args(["-p"])
+                            .arg(&plist_path)
+                            .output()
+                            .await;
+                        if let Ok(o) = verify {
+                            let content = String::from_utf8_lossy(&o.stdout);
+                            let has_icon = content.contains("CFBundleIconName");
+                            let has_icons = content.contains("CFBundleIcons");
+                            tracing::info!("Post-merge plist: CFBundleIconName={has_icon} CFBundleIcons={has_icons}");
+                            if !has_icon {
+                                tracing::warn!("Plist dump:\n{}", &content[..content.len().min(500)]);
+                            }
+                        }
                         tracing::info!("Merged actool partial plist into Info.plist");
                     }
                     Ok(o) => {
