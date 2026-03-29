@@ -1024,7 +1024,18 @@ async fn run_sign_only_pipeline(
         send_stage(progress, StageName::Signing, "Signing precompiled bundle");
         check_cancelled(cancelled)?;
 
-        let p12_path = if let Some(ref b64) = request.credentials.apple_certificate_p12_base64 {
+        // For macOS DMG notarization, use the Developer ID cert if available;
+        // for iOS/App Store, use the Distribution cert.
+        let (cert_b64, cert_pass) = if is_macos_sign {
+            if let Some(ref notarize_b64) = request.credentials.apple_notarize_certificate_p12_base64 {
+                (Some(notarize_b64.as_str()), request.credentials.apple_notarize_certificate_password.as_deref())
+            } else {
+                (request.credentials.apple_certificate_p12_base64.as_deref(), request.credentials.apple_certificate_password.as_deref())
+            }
+        } else {
+            (request.credentials.apple_certificate_p12_base64.as_deref(), request.credentials.apple_certificate_password.as_deref())
+        };
+        let p12_path = if let Some(b64) = cert_b64 {
             let decoded = base64_decode(b64)?;
             let p = tmpdir.join("signing.p12");
             std::fs::write(&p, decoded)
@@ -1033,6 +1044,16 @@ async fn run_sign_only_pipeline(
         } else {
             None
         };
+        // Also write the Distribution cert for App Store upload (used later for "both" mode)
+        let appstore_p12_path = if is_macos_sign && request.credentials.apple_notarize_certificate_p12_base64.is_some() {
+            if let Some(ref b64) = request.credentials.apple_certificate_p12_base64 {
+                let decoded = base64_decode(b64)?;
+                let p = tmpdir.join("appstore-signing.p12");
+                std::fs::write(&p, decoded)
+                    .map_err(|e| format!("Failed to write appstore p12: {e}"))?;
+                Some(p)
+            } else { None }
+        } else { None };
 
         let identity = request.credentials.apple_signing_identity.as_deref();
 
@@ -1241,7 +1262,7 @@ async fn run_sign_only_pipeline(
                 matches!(target, BuildTarget::MacOsSign), // hardened runtime for macOS
                 None,
                 Some(p12.as_path()),
-                request.credentials.apple_certificate_password.as_deref(),
+                cert_pass.or(request.credentials.apple_certificate_password.as_deref()),
             ).await?;
         }
         send_progress(progress, StageName::Signing, 100, None);
