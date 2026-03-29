@@ -232,7 +232,7 @@ async fn run_perry_update(perry_binary: &str) -> (bool, String, Option<String>) 
     // Build each target separately to keep memory usage reasonable.
     // Use cp to temp + mv to handle hardlinked same-file cases.
     let update_script = concat!(
-        "set -e; if [ ! -d ~/perry ]; then git clone https://github.com/PerryTS/perry.git ~/perry; fi; cd ~/perry; find .git -name \"*.lock\" -delete 2>/dev/null || true; rm -f .git/packed-refs; rm -rf .git/refs/remotes; git checkout -- . 2>/dev/null || true; git clean -fd 2>/dev/null || true; git fetch origin; git checkout -B main origin/main; mkdir -p ~/bin; ",
+        "set -e; if ! command -v cargo &>/dev/null; then curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; source ~/.cargo/env; rustup target add aarch64-apple-ios; fi; source ~/.cargo/env 2>/dev/null || true; if [ ! -d ~/perry ]; then git clone https://github.com/PerryTS/perry.git ~/perry; fi; cd ~/perry; find .git -name \"*.lock\" -delete 2>/dev/null || true; rm -f .git/packed-refs; rm -rf .git/refs/remotes; git checkout -- . 2>/dev/null || true; git clean -fd 2>/dev/null || true; git fetch origin; git checkout -B main origin/main; mkdir -p ~/bin; ",
         "cargo build --release -p perry; ",
         "cargo build --release -p perry-runtime -p perry-stdlib; ",
         "cargo build --release -p perry-ui-macos; ",
