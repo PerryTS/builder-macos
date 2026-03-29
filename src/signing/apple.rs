@@ -437,10 +437,14 @@ pub async fn notarize_dmg(
         tracing::warn!(error = %e, "Failed to delete .p8 key file");
     }
 
+    let notary_stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let notary_stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    tracing::info!("notarytool exit={} stdout={}", output.status.code().unwrap_or(-1), &notary_stdout[..notary_stdout.len().min(2000)]);
+    if !notary_stderr.is_empty() {
+        tracing::info!("notarytool stderr={}", &notary_stderr[..notary_stderr.len().min(500)]);
+    }
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(format!("notarytool failed:\nstdout: {stdout}\nstderr: {stderr}"));
+        return Err(format!("notarytool failed:\nstdout: {notary_stdout}\nstderr: {notary_stderr}"));
     }
 
     // Staple the notarization ticket — retry up to 3 times with delays,
