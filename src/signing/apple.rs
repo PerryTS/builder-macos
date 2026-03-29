@@ -432,19 +432,34 @@ pub async fn notarize_dmg(
         .await
         .map_err(|e| format!("Failed to run notarytool: {e}"))?;
 
-    // Immediately delete the .p8 key file
-    if let Err(e) = std::fs::remove_file(&p8_path) {
-        tracing::warn!(error = %e, "Failed to delete .p8 key file");
-    }
-
     let notary_stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let notary_stderr = String::from_utf8_lossy(&output.stderr).to_string();
     tracing::info!("notarytool exit={} stdout={}", output.status.code().unwrap_or(-1), &notary_stdout[..notary_stdout.len().min(2000)]);
     if !notary_stderr.is_empty() {
         tracing::info!("notarytool stderr={}", &notary_stderr[..notary_stderr.len().min(500)]);
     }
-    if !output.status.success() {
-        return Err(format!("notarytool failed:\nstdout: {notary_stdout}\nstderr: {notary_stderr}"));
+    if !output.status.success() || notary_stdout.contains("status: Invalid") {
+        // Fetch the rejection log before deleting the p8 key
+        if let Some(id_line) = notary_stdout.lines().find(|l| l.trim().starts_with("id:")) {
+            let sub_id = id_line.trim().strip_prefix("id:").unwrap_or("").trim();
+            if !sub_id.is_empty() {
+                let log_output = Command::new("xcrun")
+                    .args(["notarytool", "log", sub_id, "--key", p8_path.to_str().unwrap_or(""), "--key-id", key_id, "--issuer", issuer_id])
+                    .output()
+                    .await;
+                if let Ok(lo) = log_output {
+                    let log_text = String::from_utf8_lossy(&lo.stdout);
+                    tracing::error!("Notarization rejected. Log:\n{}", &log_text[..log_text.len().min(3000)]);
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&p8_path);
+        return Err(format!("Notarization rejected (status: Invalid):\nstdout: {notary_stdout}\nstderr: {notary_stderr}"));
+    }
+
+    // Delete the .p8 key file after successful notarization
+    if let Err(e) = std::fs::remove_file(&p8_path) {
+        tracing::warn!(error = %e, "Failed to delete .p8 key file");
     }
 
     // Staple the notarization ticket — retry up to 3 times with delays,
