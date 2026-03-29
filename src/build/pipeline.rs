@@ -1026,10 +1026,14 @@ async fn run_sign_only_pipeline(
 
         // For macOS DMG notarization, use the Developer ID cert if available;
         // for iOS/App Store, use the Distribution cert.
+        let has_notarize_cert = request.credentials.apple_notarize_certificate_p12_base64.is_some();
+        tracing::info!("Signing cert selection: is_macos={is_macos_sign} has_notarize_cert={has_notarize_cert} has_dist_cert={}", request.credentials.apple_certificate_p12_base64.is_some());
         let (cert_b64, cert_pass) = if is_macos_sign {
             if let Some(ref notarize_b64) = request.credentials.apple_notarize_certificate_p12_base64 {
+                tracing::info!("Using Developer ID (notarize) cert for macOS DMG signing");
                 (Some(notarize_b64.as_str()), request.credentials.apple_notarize_certificate_password.as_deref())
             } else {
+                tracing::warn!("No Developer ID cert available, using Distribution cert (notarization will fail!)");
                 (request.credentials.apple_certificate_p12_base64.as_deref(), request.credentials.apple_certificate_password.as_deref())
             }
         } else {
