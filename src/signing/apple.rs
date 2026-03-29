@@ -443,23 +443,35 @@ pub async fn notarize_dmg(
         return Err(format!("notarytool failed:\nstdout: {stdout}\nstderr: {stderr}"));
     }
 
-    // Staple the notarization ticket (non-fatal if it fails)
-    let staple_output = Command::new("xcrun")
-        .arg("stapler")
-        .arg("staple")
-        .arg(dmg_path)
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run stapler: {e}"))?;
+    // Staple the notarization ticket — retry up to 3 times with delays,
+    // Apple's CDN can take a few seconds to propagate after notarytool returns.
+    let mut stapled = false;
+    for attempt in 1..=3 {
+        let staple_output = Command::new("xcrun")
+            .arg("stapler")
+            .arg("staple")
+            .arg(dmg_path)
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run stapler: {e}"))?;
 
-    if !staple_output.status.success() {
-        // Stapling failure is non-fatal: the DMG is still notarized, Gatekeeper will verify online.
-        // This can happen when the signing cert isn't a Developer ID Application cert.
+        if staple_output.status.success() {
+            stapled = true;
+            break;
+        }
         let stdout = String::from_utf8_lossy(&staple_output.stdout);
-        tracing::warn!(
-            "stapler failed (non-fatal, app is still notarized): {}",
-            stdout.trim()
-        );
+        if attempt < 3 {
+            tracing::info!("Stapler attempt {attempt}/3 failed, retrying in 10s: {}", stdout.trim());
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        } else {
+            tracing::warn!(
+                "stapler failed after 3 attempts (non-fatal, app is still notarized): {}",
+                stdout.trim()
+            );
+        }
+    }
+    if stapled {
+        tracing::info!("Notarization ticket stapled to DMG");
     }
 
     Ok(())
