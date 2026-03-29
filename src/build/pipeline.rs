@@ -1004,7 +1004,12 @@ async fn run_sign_only_pipeline(
             let files: Vec<String> = entries.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).collect();
             tracing::info!(".app contents: {:?}", files);
         }
-        let plist_path = app_path.join("Info.plist");
+        let is_macos_sign = matches!(target, BuildTarget::MacOsSign);
+        let plist_path = if is_macos_sign {
+            app_path.join("Contents/Info.plist")
+        } else {
+            app_path.join("Info.plist")
+        };
         if plist_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&plist_path) {
                 let has_icon_name = content.contains("CFBundleIconName");
@@ -1012,7 +1017,7 @@ async fn run_sign_only_pipeline(
                 tracing::info!("Info.plist: CFBundleIconName={has_icon_name} DTPlatformName={has_dt_platform} size={}", content.len());
             }
         } else {
-            tracing::warn!("No Info.plist found in .app!");
+            tracing::warn!("No Info.plist found in .app! (looked at {})", plist_path.display());
         }
 
         // Stage 2: Sign with rcodesign
@@ -1077,9 +1082,17 @@ async fn run_sign_only_pipeline(
 
                 // Compile asset catalog using xcrun actool
                 let partial_plist = tmpdir.join("partial-info.plist");
+                let (actool_platform, actool_target, actool_compile_dir) = if is_macos_sign {
+                    ("macosx", "13.0", app_path.join("Contents/Resources").to_string_lossy().to_string())
+                } else {
+                    ("iphoneos", "17.0", app_path.to_string_lossy().to_string())
+                };
+                if is_macos_sign {
+                    std::fs::create_dir_all(app_path.join("Contents/Resources")).ok();
+                }
                 let actool_result = tokio::process::Command::new("xcrun")
-                    .args(["actool", "--compile", app_path.to_str().unwrap_or(""),
-                           "--platform", "iphoneos", "--minimum-deployment-target", "17.0",
+                    .args(["actool", "--compile", &actool_compile_dir,
+                           "--platform", actool_platform, "--minimum-deployment-target", actool_target,
                            "--app-icon", "AppIcon",
                            "--output-partial-info-plist", partial_plist.to_str().unwrap_or("")])
                     .arg(assets_dir.to_str().unwrap_or(""))
@@ -1087,10 +1100,14 @@ async fn run_sign_only_pipeline(
                     .await;
                 match actool_result {
                     Ok(o) if o.status.success() => {
-                        tracing::info!("Compiled iOS asset catalog (Assets.car)");
+                        tracing::info!("Compiled asset catalog (Assets.car)");
                         // Merge actool's partial plist into the app's Info.plist
                         // actool generates CFBundleIcons with the proper structure
-                        let plist_path = app_path.join("Info.plist");
+                        let plist_path = if is_macos_sign {
+                            app_path.join("Contents/Info.plist")
+                        } else {
+                            app_path.join("Info.plist")
+                        };
                         if partial_plist.exists() {
                             let _ = tokio::process::Command::new("/usr/libexec/PlistBuddy")
                                 .args(["-c", &format!("Merge {} :CFBundleIcons", partial_plist.to_str().unwrap_or("")),
@@ -1301,6 +1318,34 @@ async fn run_sign_only_pipeline(
                         Err(e) => tracing::warn!("Notarization failed (non-fatal): {e}"),
                     }
                     send_progress(progress, StageName::Notarizing, 100, None);
+                }
+
+                // Upload to App Store Connect if distribute is "both" or "appstore"/"testflight"
+                let distribute = request.manifest.macos_distribute.as_deref().unwrap_or("notarize");
+                if (distribute == "both" || distribute == "appstore" || distribute == "testflight") && has_notarize_creds {
+                    send_stage(progress, StageName::Publishing, "Uploading to App Store Connect");
+                    check_cancelled(cancelled)?;
+
+                    // Create a signed .pkg for App Store upload (altool needs .pkg or .dmg)
+                    let result = appstore::upload_macos_to_appstore(
+                        &dmg_path,
+                        request.credentials.apple_p8_key.as_deref().unwrap(),
+                        request.credentials.apple_key_id.as_deref().unwrap(),
+                        request.credentials.apple_issuer_id.as_deref().unwrap(),
+                        &tmpdir,
+                    ).await;
+                    match result {
+                        Ok(r) => {
+                            tracing::info!("App Store upload succeeded: {}", r.message);
+                            let _ = progress.send(ServerMessage::Published {
+                                platform: "macos".into(),
+                                message: format!("{} (DMG also available)", r.message),
+                                url: None,
+                            });
+                        }
+                        Err(e) => tracing::warn!("App Store upload failed (non-fatal, DMG still available): {e}"),
+                    }
+                    send_progress(progress, StageName::Publishing, 100, None);
                 }
 
                 let artifact = copy_artifact(&dmg_path, &request.manifest.app_name, &request.job_id, "dmg")?;
