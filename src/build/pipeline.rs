@@ -1061,7 +1061,61 @@ async fn run_sign_only_pipeline(
 
         let identity = request.credentials.apple_signing_identity.as_deref();
 
-        // Compile icon asset catalog on macOS (xcrun actool is macOS-only)
+        // Generate .icns for macOS from the source icon
+        if is_macos_sign {
+            let icon_src = ["Icon-1024.png", "AppIcon.png", "icon.png"]
+                .iter()
+                .flat_map(|n| vec![app_path.join("Contents/Resources").join(n), app_path.join(n)])
+                .find(|p| p.exists());
+
+            if let Some(icon_path) = icon_src {
+                let resources_dir = app_path.join("Contents/Resources");
+                std::fs::create_dir_all(&resources_dir).ok();
+                let iconset_dir = tmpdir.join("AppIcon.iconset");
+                std::fs::create_dir_all(&iconset_dir).ok();
+
+                // Generate all required macOS icon sizes
+                for (size, name) in &[
+                    (16, "icon_16x16.png"), (32, "icon_16x16@2x.png"),
+                    (32, "icon_32x32.png"), (64, "icon_32x32@2x.png"),
+                    (128, "icon_128x128.png"), (256, "icon_128x128@2x.png"),
+                    (256, "icon_256x256.png"), (512, "icon_256x256@2x.png"),
+                    (512, "icon_512x512.png"), (1024, "icon_512x512@2x.png"),
+                ] {
+                    let _ = tokio::process::Command::new("sips")
+                        .args(["-z", &size.to_string(), &size.to_string(),
+                               "--out", iconset_dir.join(name).to_str().unwrap_or("")])
+                        .arg(&icon_path)
+                        .output()
+                        .await;
+                }
+
+                // Convert iconset to .icns
+                let icns_result = tokio::process::Command::new("iconutil")
+                    .args(["-c", "icns", "--output"])
+                    .arg(resources_dir.join("AppIcon.icns"))
+                    .arg(&iconset_dir)
+                    .output()
+                    .await;
+                match icns_result {
+                    Ok(o) if o.status.success() => {
+                        tracing::info!("Generated AppIcon.icns for macOS");
+                        // Set CFBundleIconFile in Info.plist
+                        let _ = tokio::process::Command::new("plutil")
+                            .args(["-replace", "CFBundleIconFile", "-string", "AppIcon"])
+                            .arg(&plist_path)
+                            .output()
+                            .await;
+                    }
+                    Ok(o) => tracing::warn!("iconutil failed: {}", String::from_utf8_lossy(&o.stderr)),
+                    Err(e) => tracing::warn!("iconutil not available: {e}"),
+                }
+            } else {
+                tracing::warn!("No source icon found for macOS .icns generation");
+            }
+        }
+
+        // Compile icon asset catalog for iOS (xcrun actool is macOS-only)
         if matches!(target, BuildTarget::IosSign) {
             // Find a source icon — check multiple names the Linux worker may have used
             let icon_src = ["Icon-1024.png", "AppIcon.png", "icon.png"]
