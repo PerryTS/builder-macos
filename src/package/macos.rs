@@ -52,6 +52,17 @@ pub fn create_app_bundle(
         None
     };
 
+    // Copy resource directories (assets/, logo/, resources/, images/) into Resources/
+    // So ImageFile('assets/foo.png') resolves via NSBundle.mainBundle.resourcePath
+    let project_root = binary_path.parent().unwrap_or(Path::new("."));
+    for dir_name in &["logo", "assets", "resources", "images"] {
+        let resource_dir = project_root.join(dir_name);
+        if resource_dir.is_dir() {
+            let dest = resources_dir.join(dir_name);
+            let _ = copy_dir_recursive(&resource_dir, &dest);
+        }
+    }
+
     // Generate Info.plist
     let info_plist = generate_info_plist(manifest, icon_file_name.as_deref(), sdk_info);
     std::fs::write(contents.join("Info.plist"), info_plist)
