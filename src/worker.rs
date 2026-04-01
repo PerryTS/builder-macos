@@ -224,7 +224,7 @@ async fn run_perry_update(perry_binary: &str) -> (bool, String, Option<String>) 
     tracing::info!(ip = %vm_ip, "Update VM booted");
 
     let ssh_base = format!(
-        "{} -p '{}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 admin@{}",
+        "{} -p '{}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=40 admin@{}",
         sshpass, ssh_password, vm_ip
     );
 
