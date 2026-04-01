@@ -1402,27 +1402,86 @@ async fn run_sign_only_pipeline(
                 // Upload to App Store Connect if distribute is "both" or "appstore"/"testflight"
                 let distribute = request.manifest.macos_distribute.as_deref().unwrap_or("notarize");
                 if (distribute == "both" || distribute == "appstore" || distribute == "testflight") && has_notarize_creds {
-                    send_stage(progress, StageName::Publishing, "Uploading to App Store Connect");
-                    check_cancelled(cancelled)?;
+                    // App Store requires a .pkg signed with an installer certificate.
+                    // Re-sign the .app with the Distribution cert, create .pkg, then upload.
+                    let has_installer_cert = request.credentials.apple_installer_certificate_p12_base64.is_some();
+                    let has_dist_cert = request.credentials.apple_certificate_p12_base64.is_some();
 
-                    // Create a signed .pkg for App Store upload (altool needs .pkg or .dmg)
-                    let result = appstore::upload_macos_to_appstore(
-                        &dmg_path,
-                        request.credentials.apple_p8_key.as_deref().unwrap(),
-                        request.credentials.apple_key_id.as_deref().unwrap(),
-                        request.credentials.apple_issuer_id.as_deref().unwrap(),
-                        &tmpdir,
-                    ).await;
-                    match result {
-                        Ok(r) => {
-                            tracing::info!("App Store upload succeeded: {}", r.message);
-                            let _ = progress.send(ServerMessage::Published {
-                                platform: "macos".into(),
-                                message: format!("{} (DMG also available)", r.message),
-                                url: None,
-                            });
+                    if has_installer_cert && has_dist_cert {
+                        send_stage(progress, StageName::Publishing, "Creating .pkg for App Store");
+                        check_cancelled(cancelled)?;
+
+                        // Import Distribution + Installer certs into a temp keychain
+                        let preferred_identity = request.credentials.apple_signing_identity.as_deref();
+                        let keychain = apple::TempKeychain::create(
+                            &request.job_id,
+                            request.credentials.apple_certificate_p12_base64.as_deref().unwrap(),
+                            request.credentials.apple_certificate_password.as_deref().unwrap_or(""),
+                            &tmpdir,
+                            preferred_identity,
+                        ).await.map_err(|e| format!("Failed to create keychain: {e}"))?;
+
+                        // Import installer cert
+                        if let (Some(ref inst_b64), Some(ref inst_pass)) = (
+                            &request.credentials.apple_installer_certificate_p12_base64,
+                            &request.credentials.apple_installer_certificate_password,
+                        ) {
+                            keychain.import_additional_p12(inst_b64, inst_pass, &tmpdir)
+                                .map_err(|e| format!("Failed to import installer cert: {e}"))?;
                         }
-                        Err(e) => tracing::warn!("App Store upload failed (non-fatal, DMG still available): {e}"),
+
+                        // Re-sign .app with Distribution cert for App Store
+                        let app_store_app = tmpdir.join("appstore-app");
+                        let _ = std::fs::create_dir_all(&app_store_app);
+                        let app_store_app_path = app_store_app.join(format!("{}.app", request.manifest.app_name));
+                        if let Err(e) = copy_dir_recursive(&app_path, &app_store_app_path) {
+                            tracing::warn!("Failed to copy .app for App Store signing: {e}");
+                        }
+
+                        // Sign with Distribution identity
+                        let entitlements_path = if request.manifest.entitlements.is_some() {
+                            let p = tmpdir.join("appstore-entitlements.plist");
+                            macos::write_entitlements_plist(&request.manifest, &p)?;
+                            Some(p)
+                        } else { None };
+
+                        apple::codesign_app(
+                            &keychain.identity,
+                            entitlements_path.as_deref(),
+                            &app_store_app_path,
+                            false, // no hardened runtime for App Store
+                            Some(&keychain.path),
+                            None, // use keychain, not p12
+                            None,
+                        ).await?;
+
+                        // Create .pkg with installer identity
+                        let pkg_path = tmpdir.join(format!("{}.pkg", request.manifest.app_name));
+                        let installer_identity = apple::find_installer_identity(&keychain.path)
+                            .unwrap_or_else(|| keychain.identity.replace("Application", "Installer"));
+                        macos::create_pkg(&app_store_app_path, &pkg_path, &installer_identity).await?;
+
+                        // Upload .pkg to App Store
+                        let result = appstore::upload_macos_to_appstore(
+                            &pkg_path,
+                            request.credentials.apple_p8_key.as_deref().unwrap(),
+                            request.credentials.apple_key_id.as_deref().unwrap(),
+                            request.credentials.apple_issuer_id.as_deref().unwrap(),
+                            &tmpdir,
+                        ).await;
+                        match result {
+                            Ok(r) => {
+                                tracing::info!("App Store upload succeeded: {}", r.message);
+                                let _ = progress.send(ServerMessage::Published {
+                                    platform: "macos".into(),
+                                    message: format!("{} (DMG also available)", r.message),
+                                    url: None,
+                                });
+                            }
+                            Err(e) => tracing::warn!("App Store upload failed (non-fatal, DMG still available): {e}"),
+                        }
+                    } else {
+                        tracing::warn!("Skipping App Store upload: missing installer or distribution certificate");
                     }
                     send_progress(progress, StageName::Publishing, 100, None);
                 }
@@ -1715,4 +1774,19 @@ fn write_p12_temp(tmpdir: &std::path::Path, p12_b64: &str, suffix: &str) -> Resu
     std::fs::write(&path, &bytes)
         .map_err(|e| format!("Failed to write p12 temp file: {e}"))?;
     Ok(path)
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
+    for entry in std::fs::read_dir(src).map_err(|e| format!("readdir {}: {e}", src.display()))? {
+        let entry = entry.map_err(|e| format!("entry: {e}"))?;
+        let dest_path = dst.join(entry.file_name());
+        if entry.file_type().map_or(false, |t| t.is_dir()) {
+            copy_dir_recursive(&entry.path(), &dest_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dest_path)
+                .map_err(|e| format!("copy {}: {e}", entry.path().display()))?;
+        }
+    }
+    Ok(())
 }
