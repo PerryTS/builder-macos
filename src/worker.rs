@@ -239,6 +239,8 @@ async fn run_perry_update(perry_binary: &str) -> (bool, String, Option<String>) 
         "cargo build --release -p perry-ui-ios --target aarch64-apple-ios; ",
         "cargo build --release -p perry-runtime --target aarch64-apple-ios; ",
         "cargo build --release -p perry-stdlib --target aarch64-apple-ios; ",
+        "rustup target add aarch64-apple-tvos 2>/dev/null || true; ",
+        "cargo build --release -p perry-ui-tvos -p perry-runtime -p perry-stdlib --target aarch64-apple-tvos 2>/dev/null || true; ",
         "cp target/release/perry ~/bin/perry.tmp && mv -f ~/bin/perry.tmp ~/bin/perry; ",
         "cp target/release/libperry_runtime.a ~/bin/libperry_runtime.a.tmp && mv -f ~/bin/libperry_runtime.a.tmp ~/bin/libperry_runtime.a; ",
         "cp target/release/libperry_stdlib.a ~/bin/libperry_stdlib.a.tmp && mv -f ~/bin/libperry_stdlib.a.tmp ~/bin/libperry_stdlib.a; ",
@@ -246,6 +248,7 @@ async fn run_perry_update(perry_binary: &str) -> (bool, String, Option<String>) 
         "cp target/aarch64-apple-ios/release/libperry_runtime.a ~/bin/libperry_runtime_ios.a.tmp && mv -f ~/bin/libperry_runtime_ios.a.tmp ~/bin/libperry_runtime_ios.a; ",
         "cp target/aarch64-apple-ios/release/libperry_stdlib.a ~/bin/libperry_stdlib_ios.a.tmp && mv -f ~/bin/libperry_stdlib_ios.a.tmp ~/bin/libperry_stdlib_ios.a; ",
         "cp target/aarch64-apple-ios/release/libperry_ui_ios.a ~/bin/libperry_ui_ios.a.tmp && mv -f ~/bin/libperry_ui_ios.a.tmp ~/bin/libperry_ui_ios.a; ",
+        "if [ -d target/aarch64-apple-tvos/release ]; then cp target/aarch64-apple-tvos/release/libperry_runtime.a ~/bin/libperry_runtime_tvos.a 2>/dev/null; cp target/aarch64-apple-tvos/release/libperry_stdlib.a ~/bin/libperry_stdlib_tvos.a 2>/dev/null; cp target/aarch64-apple-tvos/release/libperry_ui_tvos.a ~/bin/libperry_ui_tvos.a 2>/dev/null; fi; ",
         // Install Apple WWDR intermediate CAs (G3, G6) so codesign can validate cert chains.
         // These get lost when the golden image is rebuilt from a clone.
         "curl -sL https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer -o /tmp/wwdr-g3.cer && sudo security add-certificates -k /Library/Keychains/System.keychain /tmp/wwdr-g3.cer 2>/dev/null || true; ",
