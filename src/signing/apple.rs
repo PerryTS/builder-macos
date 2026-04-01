@@ -97,39 +97,45 @@ impl TempKeychain {
             return Err(format!("set-key-partition-list failed: {stderr}"));
         }
 
-        // 4b. Import Apple WWDR intermediate CAs into temp keychain
-        // so find-identity can validate the full certificate chain.
-        // Download directly from Apple to avoid relying on system keychain state.
+        // 4b. Import Apple CA certs into temp keychain for chain validation.
+        // Download from Apple + copy from system keychain for completeness.
+        let mut certs_imported = 0u32;
         for url in &[
             "https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer",
             "https://www.apple.com/certificateauthority/AppleWWDRCAG6.cer",
             "https://www.apple.com/appleca/AppleIncRootCertificate.cer",
+            "https://www.apple.com/certificateauthority/AppleRootCA-G3.cer",
         ] {
-            let cert_path = tmpdir.join(format!("wwdr-{job_id}.cer"));
+            let cert_path = tmpdir.join(format!("wwdr-{job_id}-{certs_imported}.cer"));
             let dl = std::process::Command::new("curl")
-                .args(["-sL", url, "-o", cert_path.to_str().unwrap_or("")])
+                .args(["-sL", "--connect-timeout", "5", url, "-o", cert_path.to_str().unwrap_or("")])
                 .status();
-            if dl.map(|s| s.success()).unwrap_or(false) {
-                let _ = std::process::Command::new("security")
+            if dl.map(|s| s.success()).unwrap_or(false) && cert_path.exists() && std::fs::metadata(&cert_path).map(|m| m.len() > 0).unwrap_or(false) {
+                let r = std::process::Command::new("security")
                     .args(["import", cert_path.to_str().unwrap_or(""), "-k", &kc_name])
                     .status();
+                if r.map(|s| s.success()).unwrap_or(false) { certs_imported += 1; }
             }
             let _ = std::fs::remove_file(&cert_path);
         }
-        // Also export any WWDR certs from system keychain (covers older cert versions)
-        let export_out = std::process::Command::new("security")
-            .args(["find-certificate", "-a", "-c", "Apple Worldwide Developer Relations", "-p", "/Library/Keychains/System.keychain"])
-            .output();
-        if let Ok(ref out) = export_out {
-            if out.status.success() && !out.stdout.is_empty() {
-                let pem_path = tmpdir.join(format!("wwdr-sys-{job_id}.pem"));
-                let _ = std::fs::write(&pem_path, &out.stdout);
-                let _ = std::process::Command::new("security")
-                    .args(["import", pem_path.to_str().unwrap_or(""), "-k", &kc_name])
-                    .status();
-                let _ = std::fs::remove_file(&pem_path);
+        // Also copy ALL certs from system keychain (covers root + intermediate CAs)
+        for search_term in &["Apple", "Developer Relations", "Apple Root"] {
+            let export_out = std::process::Command::new("security")
+                .args(["find-certificate", "-a", "-c", search_term, "-p", "/Library/Keychains/System.keychain"])
+                .output();
+            if let Ok(ref out) = export_out {
+                if out.status.success() && !out.stdout.is_empty() {
+                    let pem_path = tmpdir.join(format!("sys-ca-{job_id}.pem"));
+                    let _ = std::fs::write(&pem_path, &out.stdout);
+                    let r = std::process::Command::new("security")
+                        .args(["import", pem_path.to_str().unwrap_or(""), "-k", &kc_name])
+                        .status();
+                    if r.map(|s| s.success()).unwrap_or(false) { certs_imported += 1; }
+                    let _ = std::fs::remove_file(&pem_path);
+                }
             }
         }
+        tracing::info!("Imported {certs_imported} CA certs into temp keychain");
 
         // 5. Detect the signing identity from the keychain
         // Try with -v (validated) first, fall back to without -v if chain validation fails
