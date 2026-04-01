@@ -1450,9 +1450,25 @@ async fn run_sign_only_pipeline(
                         ).await?;
                         let _ = std::fs::remove_file(&dist_p12_path);
 
-                        // Create .pkg — use productbuild without signing (altool validates the pkg)
+                        // Create .pkg and sign with installer cert
                         let pkg_path = tmpdir.join(format!("{}.pkg", request.manifest.app_name));
-                        macos::create_unsigned_pkg(&app_store_app_path, &pkg_path).await?;
+                        if let Some(ref inst_b64) = request.credentials.apple_installer_certificate_p12_base64 {
+                            // Import installer cert into a temp keychain for productsign
+                            let inst_pass = request.credentials.apple_installer_certificate_password.as_deref().unwrap_or("");
+                            let inst_kc = apple::TempKeychain::create(
+                                &format!("{}-inst", request.job_id),
+                                inst_b64, inst_pass, &tmpdir, None,
+                            ).await.map_err(|e| format!("Failed to create installer keychain: {e}"))?;
+                            inst_kc.add_to_search_list().map_err(|e| format!("Installer keychain search list: {e}"))?;
+                            let installer_identity = apple::find_installer_identity(&inst_kc.path)
+                                .unwrap_or_else(|| inst_kc.identity.clone());
+                            tracing::info!("Using installer identity: {installer_identity}");
+                            macos::create_pkg(&app_store_app_path, &pkg_path, &installer_identity).await?;
+                        } else {
+                            // No installer cert — create unsigned .pkg (may be rejected)
+                            tracing::warn!("No installer certificate — creating unsigned .pkg");
+                            macos::create_unsigned_pkg(&app_store_app_path, &pkg_path).await?;
+                        }
 
                         // Upload .pkg to App Store
                         let result = appstore::upload_macos_to_appstore(
