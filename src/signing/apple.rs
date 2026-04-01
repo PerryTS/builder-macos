@@ -132,12 +132,23 @@ impl TempKeychain {
         }
 
         // 5. Detect the signing identity from the keychain
+        // Try with -v (validated) first, fall back to without -v if chain validation fails
+        // (e.g. missing WWDR intermediate CA in ephemeral VMs)
         let out = std::process::Command::new("security")
             .args(["find-identity", "-v", "-p", "codesigning", &kc_name])
             .output()
             .map_err(|e| format!("Failed to query keychain identity: {e}"))?;
         let identity_output = String::from_utf8_lossy(&out.stdout);
         let identity = parse_identity_from_find_output(&identity_output, preferred_identity)
+            .or_else(|| {
+                // Retry without -v (skip chain validation)
+                let out2 = std::process::Command::new("security")
+                    .args(["find-identity", "-p", "codesigning", &kc_name])
+                    .output().ok()?;
+                let output2 = String::from_utf8_lossy(&out2.stdout);
+                tracing::info!("find-identity (no -v) for {}:\n{}", &kc_name, &output2);
+                parse_identity_from_find_output(&output2, preferred_identity)
+            })
             .ok_or_else(|| {
                 cleanup(&kc_name);
                 format!("No valid signing identity found in .p12 certificate (looking for: {:?})", preferred_identity)
