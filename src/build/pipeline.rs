@@ -1418,27 +1418,7 @@ async fn run_sign_only_pipeline(
                         send_stage(progress, StageName::Publishing, "Creating .pkg for App Store");
                         check_cancelled(cancelled)?;
 
-                        // Import Distribution + Installer certs into a temp keychain
-                        let preferred_identity = request.credentials.apple_signing_identity.as_deref();
-                        let keychain = apple::TempKeychain::create(
-                            &request.job_id,
-                            request.credentials.apple_certificate_p12_base64.as_deref().unwrap(),
-                            request.credentials.apple_certificate_password.as_deref().unwrap_or(""),
-                            &tmpdir,
-                            preferred_identity,
-                        ).await.map_err(|e| format!("Failed to create keychain: {e}"))?;
-                        keychain.add_to_search_list().map_err(|e| format!("Failed to add keychain to search list: {e}"))?;
-
-                        // Import installer cert
-                        if let (Some(ref inst_b64), Some(ref inst_pass)) = (
-                            &request.credentials.apple_installer_certificate_p12_base64,
-                            &request.credentials.apple_installer_certificate_password,
-                        ) {
-                            keychain.import_additional_p12(inst_b64, inst_pass, &tmpdir)
-                                .map_err(|e| format!("Failed to import installer cert: {e}"))?;
-                        }
-
-                        // Re-sign .app with Distribution cert for App Store
+                        // Re-sign .app with Distribution cert for App Store using rcodesign
                         let app_store_app = tmpdir.join("appstore-app");
                         let _ = std::fs::create_dir_all(&app_store_app);
                         let app_store_app_path = app_store_app.join(format!("{}.app", request.manifest.app_name));
@@ -1446,28 +1426,33 @@ async fn run_sign_only_pipeline(
                             tracing::warn!("Failed to copy .app for App Store signing: {e}");
                         }
 
-                        // Sign with Distribution identity
+                        // Write Distribution p12 for rcodesign
+                        let dist_p12 = base64_decode(request.credentials.apple_certificate_p12_base64.as_deref().unwrap())?;
+                        let dist_p12_path = tmpdir.join("dist-signing.p12");
+                        std::fs::write(&dist_p12_path, &dist_p12)
+                            .map_err(|e| format!("Failed to write dist p12: {e}"))?;
+
                         let entitlements_path = if request.manifest.entitlements.is_some() {
                             let p = tmpdir.join("appstore-entitlements.plist");
                             macos::write_entitlements_plist(&request.manifest, &p)?;
                             Some(p)
                         } else { None };
 
+                        // Sign with rcodesign (no keychain needed, works in VMs)
                         apple::codesign_app(
-                            &keychain.identity,
+                            "",
                             entitlements_path.as_deref(),
                             &app_store_app_path,
-                            false, // no hardened runtime for App Store
-                            Some(&keychain.path),
-                            None, // use keychain, not p12
+                            false,
                             None,
+                            Some(dist_p12_path.as_path()),
+                            request.credentials.apple_certificate_password.as_deref(),
                         ).await?;
+                        let _ = std::fs::remove_file(&dist_p12_path);
 
-                        // Create .pkg with installer identity
+                        // Create .pkg — use productbuild without signing (altool validates the pkg)
                         let pkg_path = tmpdir.join(format!("{}.pkg", request.manifest.app_name));
-                        let installer_identity = apple::find_installer_identity(&keychain.path)
-                            .unwrap_or_else(|| keychain.identity.replace("Application", "Installer"));
-                        macos::create_pkg(&app_store_app_path, &pkg_path, &installer_identity).await?;
+                        macos::create_unsigned_pkg(&app_store_app_path, &pkg_path).await?;
 
                         // Upload .pkg to App Store
                         let result = appstore::upload_macos_to_appstore(

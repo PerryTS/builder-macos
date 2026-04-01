@@ -88,6 +88,30 @@ pub fn write_entitlements_plist(manifest: &BuildManifest, path: &Path) -> Result
 
 /// Create a signed .pkg installer for Mac App Store submission.
 ///
+/// Create an unsigned .pkg for App Store upload.
+/// The .app inside is already signed with rcodesign; altool validates the pkg server-side.
+pub async fn create_unsigned_pkg(
+    app_path: &Path,
+    pkg_path: &Path,
+) -> Result<(), String> {
+    let output = Command::new("productbuild")
+        .arg("--component")
+        .arg(app_path)
+        .arg("/Applications")
+        .arg(pkg_path)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run productbuild: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!("productbuild (unsigned) failed: {stderr}\n{stdout}"));
+    }
+
+    Ok(())
+}
+
 /// Signs the .pkg with the installer identity derived from the app signing identity
 /// (by replacing "Application" → "Installer" in the identity name).
 pub async fn create_pkg(
