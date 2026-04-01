@@ -386,7 +386,7 @@ pub async fn codesign_app(
 
     // Fallback: Apple's codesign (for ad-hoc or when no p12 provided)
     let mut cmd = Command::new("codesign");
-    cmd.arg("--force");
+    cmd.arg("--force").arg("--deep");
     if hardened_runtime {
         cmd.arg("--options").arg("runtime");
     }
