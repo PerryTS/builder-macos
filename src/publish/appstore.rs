@@ -3,6 +3,7 @@
 //! Uses Apple's altool with API key authentication to upload .ipa files
 //! to App Store Connect for TestFlight or App Store distribution.
 
+use std::collections::HashMap;
 use std::path::Path;
 use tokio::process::Command;
 
@@ -316,4 +317,75 @@ pub async fn upload_macos_to_appstore(
     Ok(UploadResult {
         message: upload_stdout.trim().to_string(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// App Store Connect REST API — set "What's New" release notes after upload
+// ---------------------------------------------------------------------------
+
+fn generate_asc_jwt(key_id: &str, issuer_id: &str, p8_key: &str) -> Result<String, String> {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use serde::Serialize;
+    #[derive(Serialize)]
+    struct Claims { iss: String, iat: u64, exp: u64, aud: String }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("Clock error: {e}"))?.as_secs();
+    let mut header = Header::new(Algorithm::ES256);
+    header.kid = Some(key_id.to_string());
+    encode(&header, &Claims { iss: issuer_id.to_string(), iat: now, exp: now + 1200,
+        aud: "appstoreconnect-v1".to_string() },
+        &EncodingKey::from_ec_pem(p8_key.as_bytes()).map_err(|e| format!("Invalid .p8: {e}"))?)
+        .map_err(|e| format!("JWT failed: {e}"))
+}
+
+/// Set "What's New" release notes on the latest App Store version via ASC REST API.
+pub async fn set_release_notes(
+    bundle_id: &str, release_notes: &HashMap<String, String>,
+    p8_key: &str, key_id: &str, issuer_id: &str,
+) -> Result<(), String> {
+    if release_notes.is_empty() { return Ok(()); }
+    let token = generate_asc_jwt(key_id, issuer_id, p8_key)?;
+    let client = reqwest::Client::new();
+    let base = "https://api.appstoreconnect.apple.com/v1";
+
+    let apps: serde_json::Value = client.get(format!("{base}/apps?filter[bundleId]={bundle_id}"))
+        .bearer_auth(&token).send().await.map_err(|e| format!("ASC: {e}"))?
+        .json().await.map_err(|e| format!("ASC parse: {e}"))?;
+    let app_id = apps["data"].as_array().and_then(|a| a.first())
+        .and_then(|a| a["id"].as_str()).ok_or_else(|| format!("App not found: {bundle_id}"))?.to_string();
+
+    let vers: serde_json::Value = client.get(format!("{base}/apps/{app_id}/appStoreVersions?filter[appStoreState]=PREPARE_FOR_SUBMISSION,READY_FOR_REVIEW&limit=1"))
+        .bearer_auth(&token).send().await.map_err(|e| format!("ASC: {e}"))?
+        .json().await.map_err(|e| format!("ASC parse: {e}"))?;
+    let vid = vers["data"].as_array().and_then(|a| a.first())
+        .and_then(|v| v["id"].as_str()).ok_or("No editable App Store version found")?.to_string();
+
+    let locs: serde_json::Value = client.get(format!("{base}/appStoreVersions/{vid}/appStoreVersionLocalizations"))
+        .bearer_auth(&token).send().await.map_err(|e| format!("ASC: {e}"))?
+        .json().await.map_err(|e| format!("ASC parse: {e}"))?;
+    let existing: HashMap<String, String> = locs["data"].as_array()
+        .map(|a| a.iter().filter_map(|l| Some((l["attributes"]["locale"].as_str()?.to_string(), l["id"].as_str()?.to_string()))).collect())
+        .unwrap_or_default();
+
+    let mut ok = 0u32;
+    for (locale, text) in release_notes {
+        let r = if let Some(lid) = existing.get(locale) {
+            client.patch(format!("{base}/appStoreVersionLocalizations/{lid}")).bearer_auth(&token)
+                .json(&serde_json::json!({"data":{"type":"appStoreVersionLocalizations","id":lid,"attributes":{"whatsNew":text}}}))
+                .send().await
+        } else {
+            client.post(format!("{base}/appStoreVersionLocalizations")).bearer_auth(&token)
+                .json(&serde_json::json!({"data":{"type":"appStoreVersionLocalizations",
+                    "relationships":{"appStoreVersion":{"data":{"type":"appStoreVersions","id":&vid}}},
+                    "attributes":{"locale":locale,"whatsNew":text}}}))
+                .send().await
+        };
+        match r {
+            Ok(r) if r.status().is_success() => ok += 1,
+            Ok(r) => tracing::warn!(locale, status = %r.status(), "release notes failed"),
+            Err(e) => tracing::warn!(locale, "ASC: {e}"),
+        }
+    }
+    tracing::info!("Set release notes for {ok}/{} locale(s)", release_notes.len());
+    Ok(())
 }

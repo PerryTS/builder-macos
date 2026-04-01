@@ -356,14 +356,15 @@ async fn run_macos_pipeline(
         }
         send_stage(progress, StageName::Publishing, "Uploading to App Store Connect");
         check_cancelled(cancelled)?;
-        let result = appstore::upload_macos_to_appstore(
-            &pkg_path,
-            request.credentials.apple_p8_key.as_deref().unwrap(),
-            request.credentials.apple_key_id.as_deref().unwrap(),
-            request.credentials.apple_issuer_id.as_deref().unwrap(),
-            tmpdir,
-        )
-        .await?;
+        let p8 = request.credentials.apple_p8_key.as_deref().unwrap();
+        let kid = request.credentials.apple_key_id.as_deref().unwrap();
+        let iss = request.credentials.apple_issuer_id.as_deref().unwrap();
+        let result = appstore::upload_macos_to_appstore(&pkg_path, p8, kid, iss, tmpdir).await?;
+        if let Some(ref notes) = request.manifest.release_notes {
+            if let Err(e) = appstore::set_release_notes(&request.manifest.bundle_id, notes, p8, kid, iss).await {
+                tracing::warn!("Failed to set release notes (non-fatal): {e}");
+            }
+        }
         let _ = progress.send(ServerMessage::Published {
             platform: "macos".into(),
             message: format!("{} (DMG also available)", result.message),
@@ -475,14 +476,15 @@ async fn run_macos_pipeline(
             }
             send_stage(progress, StageName::Publishing, "Uploading to App Store Connect");
             check_cancelled(cancelled)?;
-            let result = appstore::upload_macos_to_appstore(
-                &pkg_path,
-                request.credentials.apple_p8_key.as_deref().unwrap(),
-                request.credentials.apple_key_id.as_deref().unwrap(),
-                request.credentials.apple_issuer_id.as_deref().unwrap(),
-                tmpdir,
-            )
-            .await?;
+            let p8 = request.credentials.apple_p8_key.as_deref().unwrap();
+            let kid = request.credentials.apple_key_id.as_deref().unwrap();
+            let iss = request.credentials.apple_issuer_id.as_deref().unwrap();
+            let result = appstore::upload_macos_to_appstore(&pkg_path, p8, kid, iss, tmpdir).await?;
+            if let Some(ref notes) = request.manifest.release_notes {
+                if let Err(e) = appstore::set_release_notes(&request.manifest.bundle_id, notes, p8, kid, iss).await {
+                    tracing::warn!("Failed to set release notes (non-fatal): {e}");
+                }
+            }
             let _ = progress.send(ServerMessage::Published {
                 platform: "macos".into(),
                 message: result.message,
@@ -742,14 +744,17 @@ async fn run_ios_pipeline(
         send_stage(progress, StageName::Publishing, "Uploading to App Store Connect");
         check_cancelled(cancelled)?;
 
-        let result = appstore::upload_to_appstore(
-            &ipa_path,
-            request.credentials.apple_p8_key.as_deref().unwrap(),
-            request.credentials.apple_key_id.as_deref().unwrap(),
-            request.credentials.apple_issuer_id.as_deref().unwrap(),
-            tmpdir,
-        )
-        .await?;
+        let p8 = request.credentials.apple_p8_key.as_deref().unwrap();
+        let kid = request.credentials.apple_key_id.as_deref().unwrap();
+        let iss = request.credentials.apple_issuer_id.as_deref().unwrap();
+        let result = appstore::upload_to_appstore(&ipa_path, p8, kid, iss, tmpdir).await?;
+
+        // Set "What's New" release notes if provided
+        if let Some(ref notes) = request.manifest.release_notes {
+            if let Err(e) = appstore::set_release_notes(&request.manifest.bundle_id, notes, p8, kid, iss).await {
+                tracing::warn!("Failed to set release notes (non-fatal): {e}");
+            }
+        }
 
         let _ = progress.send(ServerMessage::Published {
             platform: "ios".into(),
@@ -1350,16 +1355,18 @@ async fn run_sign_only_pipeline(
                     send_stage(progress, StageName::Publishing, "Uploading to App Store Connect");
                     check_cancelled(cancelled)?;
 
-                    let result = appstore::upload_to_appstore(
-                        &ipa_path,
-                        request.credentials.apple_p8_key.as_deref().unwrap(),
-                        request.credentials.apple_key_id.as_deref().unwrap(),
-                        request.credentials.apple_issuer_id.as_deref().unwrap(),
-                        &tmpdir,
-                    ).await;
+                    let p8 = request.credentials.apple_p8_key.as_deref().unwrap();
+                    let kid = request.credentials.apple_key_id.as_deref().unwrap();
+                    let iss = request.credentials.apple_issuer_id.as_deref().unwrap();
+                    let result = appstore::upload_to_appstore(&ipa_path, p8, kid, iss, &tmpdir).await;
                     match result {
                         Ok(r) => tracing::info!("App Store upload: {}", r.message),
                         Err(e) => return Err(format!("App Store upload failed:\n{e}")),
+                    }
+                    if let Some(ref notes) = request.manifest.release_notes {
+                        if let Err(e) = appstore::set_release_notes(&request.manifest.bundle_id, notes, p8, kid, iss).await {
+                            tracing::warn!("Failed to set release notes (non-fatal): {e}");
+                        }
                     }
                     send_progress(progress, StageName::Publishing, 100, None);
                 }
