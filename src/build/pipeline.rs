@@ -1427,6 +1427,7 @@ async fn run_sign_only_pipeline(
                             &tmpdir,
                             preferred_identity,
                         ).await.map_err(|e| format!("Failed to create keychain: {e}"))?;
+                        keychain.add_to_search_list().map_err(|e| format!("Failed to add keychain to search list: {e}"))?;
 
                         // Import installer cert
                         if let (Some(ref inst_b64), Some(ref inst_pass)) = (
