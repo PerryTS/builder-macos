@@ -155,6 +155,15 @@ impl TempKeychain {
                 tracing::info!("find-identity (no -v) for {}:\n{}", &kc_name, &output2);
                 parse_identity_from_find_output(&output2, preferred_identity)
             })
+            .or_else(|| {
+                // Retry without -p codesigning filter (finds installer certs too)
+                let out3 = std::process::Command::new("security")
+                    .args(["find-identity", &kc_name])
+                    .output().ok()?;
+                let output3 = String::from_utf8_lossy(&out3.stdout);
+                tracing::info!("find-identity (no filter) for {}:\n{}", &kc_name, &output3);
+                parse_identity_from_find_output(&output3, preferred_identity)
+            })
             .ok_or_else(|| {
                 cleanup(&kc_name);
                 format!("No valid signing identity found in .p12 certificate (looking for: {:?})", preferred_identity)
