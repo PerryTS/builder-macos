@@ -119,13 +119,26 @@ pub async fn create_pkg(
     pkg_path: &Path,
     installer_identity: &str,
 ) -> Result<(), String> {
-    let output = Command::new("productbuild")
-        .arg("--component")
+    create_pkg_with_keychain(app_path, pkg_path, installer_identity, None).await
+}
+
+/// Create a signed .pkg, optionally specifying a keychain to search for the identity.
+pub async fn create_pkg_with_keychain(
+    app_path: &Path,
+    pkg_path: &Path,
+    installer_identity: &str,
+    keychain: Option<&str>,
+) -> Result<(), String> {
+    let mut cmd = Command::new("productbuild");
+    cmd.arg("--component")
         .arg(app_path)
         .arg("/Applications")
         .arg("--sign")
-        .arg(installer_identity)
-        .arg(pkg_path)
+        .arg(installer_identity);
+    if let Some(kc) = keychain {
+        cmd.arg("--keychain").arg(kc);
+    }
+    let output = cmd.arg(pkg_path)
         .output()
         .await
         .map_err(|e| format!("Failed to run productbuild: {e}"))?;

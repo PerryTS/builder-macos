@@ -1463,7 +1463,7 @@ async fn run_sign_only_pipeline(
                             let installer_identity = apple::find_installer_identity(&inst_kc.path)
                                 .unwrap_or_else(|| inst_kc.identity.clone());
                             tracing::info!("Using installer identity: {installer_identity}");
-                            macos::create_pkg(&app_store_app_path, &pkg_path, &installer_identity).await?;
+                            macos::create_pkg_with_keychain(&app_store_app_path, &pkg_path, &installer_identity, Some(&inst_kc.path)).await?;
                         } else {
                             // No installer cert — create unsigned .pkg (may be rejected)
                             tracing::warn!("No installer certificate — creating unsigned .pkg");
