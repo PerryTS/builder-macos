@@ -35,7 +35,13 @@ pub async fn execute_build(
 ) -> Result<PathBuf, String> {
     // Check if this is a sign-only job (precompiled by Linux worker)
     let target = determine_target(&request.manifest.targets);
-    if matches!(target, BuildTarget::MacOsSign | BuildTarget::IosSign) {
+    if matches!(
+        target,
+        BuildTarget::MacOsSign
+            | BuildTarget::IosSign
+            | BuildTarget::TvosSign
+            | BuildTarget::WatchosSign
+    ) {
         return run_sign_only_pipeline(request, config, &cancelled, &progress, &target).await;
     }
 
@@ -86,7 +92,10 @@ async fn run_pipeline(
         BuildTarget::Ios => Some("ios"),
         BuildTarget::Android => Some("android"),
         BuildTarget::MacOs => None,
-        BuildTarget::MacOsSign | BuildTarget::IosSign => unreachable!("sign-only handled earlier"),
+        BuildTarget::MacOsSign
+        | BuildTarget::IosSign
+        | BuildTarget::TvosSign
+        | BuildTarget::WatchosSign => unreachable!("sign-only handled earlier"),
     };
     compiler::compile(
         &request.manifest,
@@ -149,7 +158,10 @@ async fn run_pipeline(
             run_android_pipeline(request, config, cancelled, progress, tmpdir, &actual_binary, &project_dir)
                 .await
         }
-        BuildTarget::MacOsSign | BuildTarget::IosSign => unreachable!("sign-only handled earlier"),
+        BuildTarget::MacOsSign
+        | BuildTarget::IosSign
+        | BuildTarget::TvosSign
+        | BuildTarget::WatchosSign => unreachable!("sign-only handled earlier"),
     }
 }
 
@@ -747,7 +759,7 @@ async fn run_ios_pipeline(
         let p8 = request.credentials.apple_p8_key.as_deref().unwrap();
         let kid = request.credentials.apple_key_id.as_deref().unwrap();
         let iss = request.credentials.apple_issuer_id.as_deref().unwrap();
-        let result = appstore::upload_to_appstore(&ipa_path, p8, kid, iss, tmpdir).await?;
+        let result = appstore::upload_to_appstore(&ipa_path, p8, kid, iss, tmpdir, "ios").await?;
 
         // Set "What's New" release notes if provided
         if let Some(ref notes) = request.manifest.release_notes {
@@ -1259,7 +1271,10 @@ async fn run_sign_only_pipeline(
         }
 
         // Embed provisioning profile for iOS (required for App Store / TestFlight)
-        if matches!(target, BuildTarget::IosSign) {
+        if matches!(
+            target,
+            BuildTarget::IosSign | BuildTarget::TvosSign | BuildTarget::WatchosSign
+        ) {
             if let Some(ref b64) = request.credentials.provisioning_profile_base64 {
                 let decoded = base64_decode(b64)?;
                 let profile_dest = app_path.join("embedded.mobileprovision");
@@ -1284,7 +1299,10 @@ async fn run_sign_only_pipeline(
 
         if let Some(ref p12) = p12_path {
             // Generate platform-appropriate entitlements
-            let entitlements_path = if matches!(target, BuildTarget::IosSign) {
+            let entitlements_path = if matches!(
+                target,
+                BuildTarget::IosSign | BuildTarget::TvosSign | BuildTarget::WatchosSign
+            ) {
                 // iOS needs minimal entitlements — just get-task-allow (for dev) and app identifier
                 // The provisioning profile handles most entitlements on iOS
                 let bundle_id = if request.manifest.bundle_id.is_empty() {
@@ -1331,7 +1349,7 @@ async fn run_sign_only_pipeline(
         send_progress(progress, StageName::Signing, 100, None);
 
         match target {
-            BuildTarget::IosSign => {
+            BuildTarget::IosSign | BuildTarget::TvosSign | BuildTarget::WatchosSign => {
                 // Log .app contents before .ipa creation
                 if let Ok(entries) = std::fs::read_dir(&app_path) {
                     let files: Vec<String> = entries.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).collect();
@@ -1358,7 +1376,13 @@ async fn run_sign_only_pipeline(
                     let p8 = request.credentials.apple_p8_key.as_deref().unwrap();
                     let kid = request.credentials.apple_key_id.as_deref().unwrap();
                     let iss = request.credentials.apple_issuer_id.as_deref().unwrap();
-                    let result = appstore::upload_to_appstore(&ipa_path, p8, kid, iss, &tmpdir).await;
+                    let upload_platform = match target {
+                        BuildTarget::TvosSign => "tvos",
+                        // TODO(watchos): confirm altool --type for standalone watchOS
+                        BuildTarget::WatchosSign => "ios",
+                        _ => "ios",
+                    };
+                    let result = appstore::upload_to_appstore(&ipa_path, p8, kid, iss, &tmpdir, upload_platform).await;
                     match result {
                         Ok(r) => tracing::info!("App Store upload: {}", r.message),
                         Err(e) => return Err(format!("App Store upload failed:\n{e}")),
@@ -1559,6 +1583,8 @@ enum BuildTarget {
     Android,
     MacOsSign,
     IosSign,
+    TvosSign,
+    WatchosSign,
 }
 
 fn determine_target(targets: &[String]) -> BuildTarget {
@@ -1566,6 +1592,8 @@ fn determine_target(targets: &[String]) -> BuildTarget {
         match t.to_lowercase().as_str() {
             "ios" => return BuildTarget::Ios,
             "ios-sign" => return BuildTarget::IosSign,
+            "tvos-sign" => return BuildTarget::TvosSign,
+            "watchos-sign" => return BuildTarget::WatchosSign,
             "macos-sign" => return BuildTarget::MacOsSign,
             "android" => return BuildTarget::Android,
             _ => {}
