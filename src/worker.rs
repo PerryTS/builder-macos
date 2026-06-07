@@ -57,43 +57,100 @@ async fn upload_artifact(
 }
 
 /// Download a base64-encoded tarball from the hub and write the decoded bytes to a temp file.
+///
+/// The hub (perry-compiled) intermittently serves a corrupted artifact body
+/// under concurrent GC pressure — the response is not valid base64 from offset 0
+/// ("Invalid symbol N, offset 0"), or decodes to bytes that are not a real
+/// archive. Retry the whole fetch+decode several times and validate the decoded
+/// bytes look like an archive (gzip `1f 8b` for macOS bundles, or ZIP `50 4b`
+/// "PK" for iOS/tvOS bundles) before accepting.
 async fn download_tarball(url: &str, job_id: &str, auth_token: Option<&str>) -> Result<PathBuf, String> {
-    tracing::info!(url = %url, "Downloading tarball");
+    const MAX_ATTEMPTS: u32 = 6;
     let client = reqwest::Client::builder()
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
-    let mut req = client.get(url);
-    if let Some(token) = auth_token {
-        req = req.header("Authorization", format!("Bearer {token}"));
+
+    let mut last_err = String::from("no attempt made");
+    for attempt in 1..=MAX_ATTEMPTS {
+        tracing::info!(url = %url, attempt, "Downloading tarball");
+        let mut req = client.get(url);
+        if let Some(token) = auth_token {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!("HTTP request failed: {e} (is_connect={}, is_timeout={})", e.is_connect(), e.is_timeout());
+                tracing::warn!(attempt, "{last_err}; retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                continue;
+            }
+        };
+
+        let status = resp.status();
+        if !status.is_success() {
+            // 4xx (FORBIDDEN / NOT_FOUND) will not be fixed by retrying.
+            if status.is_client_error() {
+                return Err(format!("Hub returned HTTP {status}"));
+            }
+            last_err = format!("Hub returned HTTP {status}");
+            tracing::warn!(attempt, "{last_err}; retrying");
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            continue;
+        }
+
+        let b64_text = match resp.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                last_err = format!("Failed to read tarball response body: {e}");
+                tracing::warn!(attempt, "{last_err}; retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                continue;
+            }
+        };
+
+        use base64::Engine;
+        let tarball_bytes = match base64::engine::general_purpose::STANDARD.decode(b64_text.trim()) {
+            Ok(b) => b,
+            Err(e) => {
+                last_err = format!("Failed to base64-decode tarball: {e}");
+                tracing::warn!(attempt, "{last_err}; retrying (hub served corrupted body)");
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                continue;
+            }
+        };
+
+        // Verify the decoded bytes look like a real archive before trusting them.
+        // macOS precompiled bundles are gzip tarballs (magic 1f 8b); iOS/tvOS
+        // bundles are ZIP archives (magic 50 4b "PK"). Accept either.
+        let is_gzip =
+            tarball_bytes.len() >= 2 && tarball_bytes[0] == 0x1f && tarball_bytes[1] == 0x8b;
+        let is_zip =
+            tarball_bytes.len() >= 4 && tarball_bytes[0] == 0x50 && tarball_bytes[1] == 0x4b;
+        if !is_gzip && !is_zip {
+            last_err = format!(
+                "decoded bundle is neither gzip nor zip (len={}, first bytes={:02x?})",
+                tarball_bytes.len(),
+                &tarball_bytes[..tarball_bytes.len().min(4)]
+            );
+            tracing::warn!(attempt, "{last_err}; retrying");
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            continue;
+        }
+
+        let dl_dir = std::env::temp_dir().join("perry-worker-dl");
+        std::fs::create_dir_all(&dl_dir)
+            .map_err(|e| format!("Failed to create download dir: {e}"))?;
+        let tarball_path = dl_dir.join(format!("{job_id}.tar.gz"));
+        std::fs::write(&tarball_path, &tarball_bytes)
+            .map_err(|e| format!("Failed to write tarball to disk: {e}"))?;
+        if attempt > 1 {
+            tracing::info!(attempt, "tarball download succeeded after retry");
+        }
+        return Ok(tarball_path);
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("HTTP request failed: {e} (url={url}, is_builder={}, is_connect={}, is_timeout={})", e.is_builder(), e.is_connect(), e.is_timeout()))?;
 
-    if !resp.status().is_success() {
-        return Err(format!("Hub returned HTTP {}", resp.status()));
-    }
-
-    let b64_text = resp
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read tarball response body: {e}"))?;
-
-    use base64::Engine;
-    let tarball_bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64_text.trim())
-        .map_err(|e| format!("Failed to base64-decode tarball: {e}"))?;
-
-    let dl_dir = std::env::temp_dir().join("perry-worker-dl");
-    std::fs::create_dir_all(&dl_dir)
-        .map_err(|e| format!("Failed to create download dir: {e}"))?;
-
-    let tarball_path = dl_dir.join(format!("{job_id}.tar.gz"));
-    std::fs::write(&tarball_path, &tarball_bytes)
-        .map_err(|e| format!("Failed to write tarball to disk: {e}"))?;
-
-    Ok(tarball_path)
+    Err(format!("Failed to download tarball after {MAX_ATTEMPTS} attempts: {last_err}"))
 }
 
 #[derive(Debug, Deserialize)]
