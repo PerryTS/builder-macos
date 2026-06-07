@@ -1270,6 +1270,262 @@ async fn run_sign_only_pipeline(
             }
         }
 
+        // tvOS: fix up the cross-compiled bundle's Info.plist + app icon so App
+        // Store Connect accepts it. The Linux build produces an iphoneos-flavored
+        // bundle; Apple rejects it for tvOS with three errors that we fix here:
+        //   1. Invalid CFBundlePackageType (must be APPL)
+        //   2. Missing CFBundleIcons.CFBundlePrimaryIcon
+        //   3. Unsupported SDK/Xcode version (iphoneos DT* values)
+        if matches!(target, BuildTarget::TvosSign) {
+            let plist_path = app_path.join("Info.plist");
+
+            // --- A. CFBundlePackageType = APPL ---
+            let _ = tokio::process::Command::new("plutil")
+                .args(["-replace", "CFBundlePackageType", "-string", "APPL"])
+                .arg(&plist_path)
+                .output()
+                .await;
+
+            // --- B. tvOS DT/SDK values (overwrite the iphoneos ones) ---
+            let sdk = query_tvos_sdk_info().await;
+            tracing::info!(
+                "tvOS SDK info: platform_version={} sdk_name={} sdk_build={} xcode={} xcode_build={}",
+                sdk.platform_version, sdk.sdk_name, sdk.sdk_build, sdk.xcode, sdk.xcode_build
+            );
+            // (key, value) pairs to force onto the tvOS Info.plist.
+            let dt_pairs: &[(&str, &str)] = &[
+                ("DTPlatformName", "appletvos"),
+                ("DTPlatformVersion", &sdk.platform_version),
+                ("DTPlatformBuild", &sdk.sdk_build),
+                ("DTSDKName", &sdk.sdk_name),
+                ("DTSDKBuild", &sdk.sdk_build),
+                ("DTXcode", &sdk.xcode),
+                ("DTXcodeBuild", &sdk.xcode_build),
+                ("DTCompiler", "com.apple.compilers.llvm.clang.1_0"),
+                ("BuildMachineOSBuild", &sdk.xcode_build),
+                // tvOS uses MinimumOSVersion (LSMinimumSystemVersion is macOS).
+                ("MinimumOSVersion", "17.0"),
+                ("LSMinimumSystemVersion", "17.0"),
+            ];
+            for (key, value) in dt_pairs {
+                // plutil -replace inserts the key if it's missing, replaces otherwise.
+                let _ = tokio::process::Command::new("plutil")
+                    .args(["-replace", key, "-string", value])
+                    .arg(&plist_path)
+                    .output()
+                    .await;
+            }
+            // CFBundleSupportedPlatforms must be [AppleTVOS], not [iPhoneOS].
+            let _ = tokio::process::Command::new("plutil")
+                .args(["-replace", "CFBundleSupportedPlatforms", "-json", r#"["AppleTVOS"]"#])
+                .arg(&plist_path)
+                .output()
+                .await;
+
+            // --- C. tvOS app icon (Brand Assets) → CFBundleIcons.CFBundlePrimaryIcon ---
+            let icon_src = ["Icon-1024.png", "AppIcon.png", "icon.png"]
+                .iter()
+                .map(|n| app_path.join(n))
+                .find(|p| p.exists());
+
+            if let Some(icon_path) = icon_src {
+                let assets_dir = tmpdir.join("Assets.xcassets");
+                let brand = assets_dir.join("App Icon & Top Shelf Image.brandassets");
+                std::fs::create_dir_all(&brand).ok();
+
+                // Helper: write a single-layer .imagestack with a Content.imageset
+                // holding one RGB (no-alpha) PNG resized from the source icon.
+                //
+                // returns Ok(()) on success; PNG encode/resize failures are logged.
+                let make_imagestack = |stack_dir: &std::path::Path,
+                                       layer_name: &str,
+                                       png_name: &str,
+                                       w: u32,
+                                       h: u32|
+                 -> std::io::Result<()> {
+                    let layer = stack_dir.join(format!("{layer_name}.imagestacklayer"));
+                    let content = layer.join("Content.imageset");
+                    std::fs::create_dir_all(&content)?;
+                    // imagestack Contents.json: one layer
+                    std::fs::write(
+                        stack_dir.join("Contents.json"),
+                        format!(
+                            r#"{{"info":{{"author":"perry","version":1}},"layers":[{{"filename":"{layer_name}.imagestacklayer"}}]}}"#
+                        ),
+                    )?;
+                    // imagestacklayer Contents.json
+                    std::fs::write(
+                        layer.join("Contents.json"),
+                        r#"{"info":{"author":"perry","version":1}}"#,
+                    )?;
+                    // Content.imageset Contents.json (single universal tvOS image, 1x)
+                    std::fs::write(
+                        content.join("Contents.json"),
+                        format!(
+                            r#"{{"images":[{{"filename":"{png_name}","idiom":"tv","scale":"1x"}}],"info":{{"author":"perry","version":1}}}}"#
+                        ),
+                    )?;
+                    // Resize source icon to w x h, flatten to RGB (no alpha).
+                    if let Ok(img) = image::open(&icon_path) {
+                        let resized =
+                            img.resize_exact(w, h, image::imageops::FilterType::Lanczos3);
+                        let rgb = resized.to_rgb8();
+                        rgb.save(content.join(png_name))
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    }
+                    Ok(())
+                };
+
+                // App Icon (small) — 400x240, role: primary-app-icon
+                let app_icon = brand.join("App Icon.imagestack");
+                std::fs::create_dir_all(&app_icon).ok();
+                if let Err(e) =
+                    make_imagestack(&app_icon, "Front", "front.png", 400, 240)
+                {
+                    tracing::warn!("tvOS App Icon imagestack gen failed: {e}");
+                }
+
+                // App Icon - App Store (large) — 1280x768
+                let app_icon_store = brand.join("App Icon - App Store.imagestack");
+                std::fs::create_dir_all(&app_icon_store).ok();
+                if let Err(e) =
+                    make_imagestack(&app_icon_store, "Front", "front.png", 1280, 768)
+                {
+                    tracing::warn!("tvOS App Store icon imagestack gen failed: {e}");
+                }
+
+                // Top Shelf Image — 1920x720 (plain imageset, not an imagestack)
+                let top_shelf = brand.join("Top Shelf Image.imageset");
+                std::fs::create_dir_all(&top_shelf).ok();
+                {
+                    std::fs::write(
+                        top_shelf.join("Contents.json"),
+                        r#"{"images":[{"filename":"topshelf.png","idiom":"tv","scale":"1x"}],"info":{"author":"perry","version":1}}"#,
+                    )
+                    .ok();
+                    if let Ok(img) = image::open(&icon_path) {
+                        let resized = img.resize_exact(
+                            1920,
+                            720,
+                            image::imageops::FilterType::Lanczos3,
+                        );
+                        resized.to_rgb8().save(top_shelf.join("topshelf.png")).ok();
+                    }
+                }
+
+                // brandassets Contents.json: declare the icon roles
+                std::fs::write(
+                    brand.join("Contents.json"),
+                    r#"{"assets":[
+                        {"filename":"App Icon.imagestack","idiom":"tv","role":"primary-app-icon","size":"400x240"},
+                        {"filename":"App Icon - App Store.imagestack","idiom":"tv","role":"primary-app-icon","size":"1280x768"},
+                        {"filename":"Top Shelf Image.imageset","idiom":"tv","role":"top-shelf-image","size":"1920x720"}
+                    ],"info":{"author":"perry","version":1}}"#,
+                )
+                .ok();
+                std::fs::write(
+                    assets_dir.join("Contents.json"),
+                    r#"{"info":{"author":"perry","version":1}}"#,
+                )
+                .ok();
+
+                // Compile the catalog with actool for the appletvos platform.
+                let partial_plist = tmpdir.join("tvos-partial-info.plist");
+                let actool_result = tokio::process::Command::new("xcrun")
+                    .args([
+                        "actool",
+                        "--compile",
+                        app_path.to_str().unwrap_or(""),
+                        "--platform",
+                        "appletvos",
+                        "--minimum-deployment-target",
+                        "17.0",
+                        "--app-icon",
+                        "App Icon",
+                        "--output-partial-info-plist",
+                        partial_plist.to_str().unwrap_or(""),
+                    ])
+                    .arg(assets_dir.to_str().unwrap_or(""))
+                    .output()
+                    .await;
+                match actool_result {
+                    Ok(o) if o.status.success() => {
+                        tracing::info!("Compiled tvOS Brand Assets catalog (Assets.car)");
+                        if partial_plist.exists() {
+                            if let Ok(partial_content) =
+                                std::fs::read_to_string(&partial_plist)
+                            {
+                                if partial_content.contains("CFBundleIcons") {
+                                    let _ = tokio::process::Command::new(
+                                        "/usr/libexec/PlistBuddy",
+                                    )
+                                    .args([
+                                        "-c",
+                                        "Delete :CFBundleIcons",
+                                        plist_path.to_str().unwrap_or(""),
+                                    ])
+                                    .output()
+                                    .await;
+                                    let _ = tokio::process::Command::new(
+                                        "/usr/libexec/PlistBuddy",
+                                    )
+                                    .args([
+                                        "-c",
+                                        &format!(
+                                            "Merge {}",
+                                            partial_plist.to_str().unwrap_or("")
+                                        ),
+                                        plist_path.to_str().unwrap_or(""),
+                                    ])
+                                    .output()
+                                    .await;
+                                }
+                            }
+                        }
+                        // Root-level CFBundleIconName for good measure.
+                        let _ = tokio::process::Command::new("plutil")
+                            .args(["-replace", "CFBundleIconName", "-string", "App Icon"])
+                            .arg(&plist_path)
+                            .output()
+                            .await;
+                    }
+                    Ok(o) => {
+                        tracing::warn!(
+                            "tvOS actool failed (non-fatal): {}",
+                            String::from_utf8_lossy(&o.stderr)
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("tvOS actool not available (non-fatal): {e}");
+                    }
+                }
+            } else {
+                tracing::warn!("No source icon found for tvOS Brand Assets generation");
+            }
+
+            // Normalize to binary plist (matches iOS path's final conversion).
+            let _ = tokio::process::Command::new("plutil")
+                .args(["-convert", "binary1"])
+                .arg(&plist_path)
+                .output()
+                .await;
+            // Verify the three required things landed.
+            if let Ok(o) = tokio::process::Command::new("plutil")
+                .args(["-p"])
+                .arg(&plist_path)
+                .output()
+                .await
+            {
+                let c = String::from_utf8_lossy(&o.stdout);
+                tracing::info!(
+                    "tvOS post-fix plist: PackageType_APPL={} CFBundleIcons={} DTPlatformName_appletvos={}",
+                    c.contains("\"CFBundlePackageType\" => \"APPL\""),
+                    c.contains("CFBundleIcons"),
+                    c.contains("\"DTPlatformName\" => \"appletvos\"")
+                );
+            }
+        }
+
         // Embed provisioning profile for iOS (required for App Store / TestFlight)
         if matches!(
             target,
@@ -1744,6 +2000,30 @@ async fn query_sdk_info() -> ios::SdkInfo {
     ios::SdkInfo {
         platform_version: sdk_version.clone(),
         sdk_name: format!("iphoneos{sdk_version}"),
+        sdk_build,
+        xcode,
+        xcode_build,
+    }
+}
+
+/// Query the local Xcode installation for tvOS (appletvos) SDK/version info.
+/// Mirrors `query_sdk_info` but for the appletvos SDK. Used to rewrite the
+/// DT*/SDK keys in a cross-compiled tvOS bundle's Info.plist during signing,
+/// since the Linux-built bundle ships with iphoneos DT values that App Store
+/// Connect rejects ("Unsupported SDK or Xcode version").
+async fn query_tvos_sdk_info() -> ios::SdkInfo {
+    let (xcode, xcode_build) = query_xcode_info().await;
+
+    // Xcode 26.3 (17C529) ships with tvOS SDK 26.2 (build 23C57).
+    let (sdk_version, sdk_build) = if std::env::var("PERRY_DT_XCODE").is_ok() {
+        ("26.2".to_string(), "23C57".to_string())
+    } else {
+        query_sdk_version("appletvos", "26.2", "23C57").await
+    };
+
+    ios::SdkInfo {
+        platform_version: sdk_version.clone(),
+        sdk_name: format!("appletvos{sdk_version}"),
         sdk_build,
         xcode,
         xcode_build,
