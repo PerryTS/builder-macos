@@ -1333,103 +1333,124 @@ async fn run_sign_only_pipeline(
                 let brand = assets_dir.join("App Icon & Top Shelf Image.brandassets");
                 std::fs::create_dir_all(&brand).ok();
 
-                // Helper: write a single-layer .imagestack with a Content.imageset
-                // holding one RGB (no-alpha) PNG resized from the source icon.
+                // Helper: write a 2-layer .imagestack (Back + Front), each holding
+                // a Content.imageset with one RGB (no-alpha) PNG resized from the
+                // source icon. actool rejects single-layer imagestacks
+                // ("must have at least 2 layers").
                 //
                 // returns Ok(()) on success; PNG encode/resize failures are logged.
                 let make_imagestack = |stack_dir: &std::path::Path,
-                                       layer_name: &str,
-                                       png_name: &str,
                                        w: u32,
                                        h: u32|
                  -> std::io::Result<()> {
-                    let layer = stack_dir.join(format!("{layer_name}.imagestacklayer"));
-                    let content = layer.join("Content.imageset");
-                    std::fs::create_dir_all(&content)?;
-                    // imagestack Contents.json: one layer
+                    // imagestack Contents.json
                     std::fs::write(
                         stack_dir.join("Contents.json"),
-                        format!(
-                            r#"{{"info":{{"author":"perry","version":1}},"layers":[{{"filename":"{layer_name}.imagestacklayer"}}]}}"#
-                        ),
+                        r#"{"info":{"author":"xcode","version":1}}"#,
                     )?;
-                    // imagestacklayer Contents.json
+                    // Resize source icon once; reuse for every layer.
+                    let resized = image::open(&icon_path).ok().map(|img| {
+                        img.resize_exact(w, h, image::imageops::FilterType::Lanczos3)
+                            .to_rgb8()
+                    });
+                    // Create both required layers (Back + Front).
+                    for layer_name in ["Back", "Front"] {
+                        let layer =
+                            stack_dir.join(format!("{layer_name}.imagestacklayer"));
+                        let content = layer.join("Content.imageset");
+                        std::fs::create_dir_all(&content)?;
+                        // imagestacklayer Contents.json
+                        std::fs::write(
+                            layer.join("Contents.json"),
+                            r#"{"info":{"author":"xcode","version":1}}"#,
+                        )?;
+                        // Content.imageset Contents.json (single tvOS image, 1x)
+                        std::fs::write(
+                            content.join("Contents.json"),
+                            r#"{"images":[{"idiom":"tv","filename":"img.png","scale":"1x"}],"info":{"author":"xcode","version":1}}"#,
+                        )?;
+                        if let Some(ref rgb) = resized {
+                            rgb.save(content.join("img.png"))
+                                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                        }
+                    }
+                    Ok(())
+                };
+
+                // Helper: write a flat imageset (idiom "tv", scale "1x").
+                let make_imageset = |set_dir: &std::path::Path,
+                                     w: u32,
+                                     h: u32|
+                 -> std::io::Result<()> {
+                    std::fs::create_dir_all(set_dir)?;
                     std::fs::write(
-                        layer.join("Contents.json"),
-                        r#"{"info":{"author":"perry","version":1}}"#,
+                        set_dir.join("Contents.json"),
+                        r#"{"images":[{"idiom":"tv","filename":"img.png","scale":"1x"}],"info":{"author":"xcode","version":1}}"#,
                     )?;
-                    // Content.imageset Contents.json (single universal tvOS image, 1x)
-                    std::fs::write(
-                        content.join("Contents.json"),
-                        format!(
-                            r#"{{"images":[{{"filename":"{png_name}","idiom":"tv","scale":"1x"}}],"info":{{"author":"perry","version":1}}}}"#
-                        ),
-                    )?;
-                    // Resize source icon to w x h, flatten to RGB (no alpha).
                     if let Ok(img) = image::open(&icon_path) {
                         let resized =
                             img.resize_exact(w, h, image::imageops::FilterType::Lanczos3);
-                        let rgb = resized.to_rgb8();
-                        rgb.save(content.join(png_name))
+                        resized
+                            .to_rgb8()
+                            .save(set_dir.join("img.png"))
                             .map_err(|e| std::io::Error::other(e.to_string()))?;
                     }
                     Ok(())
                 };
 
-                // App Icon (small) — 400x240, role: primary-app-icon
+                // App Icon (small) — 400x240, role: primary-app-icon (2 layers)
                 let app_icon = brand.join("App Icon.imagestack");
                 std::fs::create_dir_all(&app_icon).ok();
-                if let Err(e) =
-                    make_imagestack(&app_icon, "Front", "front.png", 400, 240)
-                {
+                if let Err(e) = make_imagestack(&app_icon, 400, 240) {
                     tracing::warn!("tvOS App Icon imagestack gen failed: {e}");
                 }
 
-                // App Icon - App Store (large) — 1280x768
+                // App Icon - App Store (large) — 1280x768 (2 layers)
                 let app_icon_store = brand.join("App Icon - App Store.imagestack");
                 std::fs::create_dir_all(&app_icon_store).ok();
-                if let Err(e) =
-                    make_imagestack(&app_icon_store, "Front", "front.png", 1280, 768)
-                {
+                if let Err(e) = make_imagestack(&app_icon_store, 1280, 768) {
                     tracing::warn!("tvOS App Store icon imagestack gen failed: {e}");
                 }
 
-                // Top Shelf Image — 1920x720 (plain imageset, not an imagestack)
+                // Top Shelf Image — 1920x720 (flat imageset)
                 let top_shelf = brand.join("Top Shelf Image.imageset");
-                std::fs::create_dir_all(&top_shelf).ok();
-                {
-                    std::fs::write(
-                        top_shelf.join("Contents.json"),
-                        r#"{"images":[{"filename":"topshelf.png","idiom":"tv","scale":"1x"}],"info":{"author":"perry","version":1}}"#,
-                    )
-                    .ok();
-                    if let Ok(img) = image::open(&icon_path) {
-                        let resized = img.resize_exact(
-                            1920,
-                            720,
-                            image::imageops::FilterType::Lanczos3,
-                        );
-                        resized.to_rgb8().save(top_shelf.join("topshelf.png")).ok();
-                    }
+                if let Err(e) = make_imageset(&top_shelf, 1920, 720) {
+                    tracing::warn!("tvOS Top Shelf Image gen failed: {e}");
                 }
 
-                // brandassets Contents.json: declare the icon roles
+                // Top Shelf Image Wide — 2320x720 (flat imageset)
+                let top_shelf_wide = brand.join("Top Shelf Image Wide.imageset");
+                if let Err(e) = make_imageset(&top_shelf_wide, 2320, 720) {
+                    tracing::warn!("tvOS Top Shelf Image Wide gen failed: {e}");
+                }
+
+                // brandassets Contents.json: declare all four asset roles
                 std::fs::write(
                     brand.join("Contents.json"),
                     r#"{"assets":[
                         {"filename":"App Icon.imagestack","idiom":"tv","role":"primary-app-icon","size":"400x240"},
                         {"filename":"App Icon - App Store.imagestack","idiom":"tv","role":"primary-app-icon","size":"1280x768"},
-                        {"filename":"Top Shelf Image.imageset","idiom":"tv","role":"top-shelf-image","size":"1920x720"}
-                    ],"info":{"author":"perry","version":1}}"#,
+                        {"filename":"Top Shelf Image.imageset","idiom":"tv","role":"top-shelf-image","size":"1920x720"},
+                        {"filename":"Top Shelf Image Wide.imageset","idiom":"tv","role":"top-shelf-image-wide","size":"2320x720"}
+                    ],"info":{"author":"xcode","version":1}}"#,
                 )
                 .ok();
                 std::fs::write(
                     assets_dir.join("Contents.json"),
-                    r#"{"info":{"author":"perry","version":1}}"#,
+                    r#"{"info":{"author":"xcode","version":1}}"#,
                 )
                 .ok();
 
                 // Compile the catalog with actool for the appletvos platform.
+                // Critical fixes (validated directly on the Mac):
+                //   - the --compile output dir must pre-exist (we compile into the
+                //     .app so Assets.car lands in the bundle root, like the iOS path);
+                //   - pass --target-device tv;
+                //   - --app-icon must be the *brandassets bundle name*
+                //     "App Icon & Top Shelf Image" (NOT "App Icon").
+                // Produces a partial plist with CFBundleIcons.CFBundlePrimaryIcon AND
+                // TVTopShelfImage.{TVTopShelfPrimaryImage,TVTopShelfPrimaryImageWide}.
+                std::fs::create_dir_all(&app_path).ok();
                 let partial_plist = tmpdir.join("tvos-partial-info.plist");
                 let actool_result = tokio::process::Command::new("xcrun")
                     .args([
@@ -1440,8 +1461,10 @@ async fn run_sign_only_pipeline(
                         "appletvos",
                         "--minimum-deployment-target",
                         "17.0",
+                        "--target-device",
+                        "tv",
                         "--app-icon",
-                        "App Icon",
+                        "App Icon & Top Shelf Image",
                         "--output-partial-info-plist",
                         partial_plist.to_str().unwrap_or(""),
                     ])
@@ -1451,24 +1474,43 @@ async fn run_sign_only_pipeline(
                 match actool_result {
                     Ok(o) if o.status.success() => {
                         tracing::info!("Compiled tvOS Brand Assets catalog (Assets.car)");
-                        if partial_plist.exists() {
-                            if let Ok(partial_content) =
-                                std::fs::read_to_string(&partial_plist)
-                            {
-                                if partial_content.contains("CFBundleIcons") {
-                                    let _ = tokio::process::Command::new(
-                                        "/usr/libexec/PlistBuddy",
-                                    )
-                                    .args([
-                                        "-c",
-                                        "Delete :CFBundleIcons",
-                                        plist_path.to_str().unwrap_or(""),
-                                    ])
-                                    .output()
-                                    .await;
-                                    let _ = tokio::process::Command::new(
-                                        "/usr/libexec/PlistBuddy",
-                                    )
+                    }
+                    Ok(o) => {
+                        // Non-fatal: actool currently errors on a missing tvOS
+                        // simulator runtime (being fixed separately). Still merge
+                        // whatever partial plist it produced, like the iOS block.
+                        tracing::warn!(
+                            "tvOS actool failed (non-fatal): {}",
+                            String::from_utf8_lossy(&o.stderr)
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("tvOS actool not available (non-fatal): {e}");
+                    }
+                }
+
+                // Merge the WHOLE partial plist (CFBundleIcons + TVTopShelfImage)
+                // into the app's Info.plist, regardless of actool's exit status.
+                if partial_plist.exists() {
+                    if let Ok(partial_content) = std::fs::read_to_string(&partial_plist) {
+                        if partial_content.contains("CFBundleIcons")
+                            || partial_content.contains("TVTopShelfImage")
+                        {
+                            // Drop any stale keys first so Merge fully replaces them.
+                            for key in ["CFBundleIcons", "TVTopShelfImage"] {
+                                let _ = tokio::process::Command::new(
+                                    "/usr/libexec/PlistBuddy",
+                                )
+                                .args([
+                                    "-c",
+                                    &format!("Delete :{key}"),
+                                    plist_path.to_str().unwrap_or(""),
+                                ])
+                                .output()
+                                .await;
+                            }
+                            let _ =
+                                tokio::process::Command::new("/usr/libexec/PlistBuddy")
                                     .args([
                                         "-c",
                                         &format!(
@@ -1479,29 +1521,50 @@ async fn run_sign_only_pipeline(
                                     ])
                                     .output()
                                     .await;
-                                }
-                            }
+                            tracing::info!(
+                                "Merged tvOS actool partial plist into Info.plist"
+                            );
                         }
-                        // Root-level CFBundleIconName for good measure.
-                        let _ = tokio::process::Command::new("plutil")
-                            .args(["-replace", "CFBundleIconName", "-string", "App Icon"])
-                            .arg(&plist_path)
-                            .output()
-                            .await;
                     }
-                    Ok(o) => {
-                        tracing::warn!(
-                            "tvOS actool failed (non-fatal): {}",
-                            String::from_utf8_lossy(&o.stderr)
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("tvOS actool not available (non-fatal): {e}");
+                }
+                // Root-level CFBundleIconName for good measure.
+                let _ = tokio::process::Command::new("plutil")
+                    .args(["-replace", "CFBundleIconName", "-string", "App Icon"])
+                    .arg(&plist_path)
+                    .output()
+                    .await;
+
+                // If actool emitted an Assets.car anywhere other than the bundle
+                // root, copy it in (we compile directly into the .app, but be safe).
+                let car_in_app = app_path.join("Assets.car");
+                if !car_in_app.exists() {
+                    let car_in_tmp = assets_dir
+                        .parent()
+                        .map(|p| p.join("Assets.car"))
+                        .filter(|p| p.exists());
+                    if let Some(src) = car_in_tmp {
+                        if let Err(e) = std::fs::copy(&src, &car_in_app) {
+                            tracing::warn!("Failed to copy tvOS Assets.car: {e}");
+                        }
                     }
                 }
             } else {
                 tracing::warn!("No source icon found for tvOS Brand Assets generation");
             }
+
+            // --- D. UIRequiredDeviceCapabilities = [arm64] ---
+            // Apple requires this array for the 64-bit tvOS slice. Must be an
+            // ARRAY of strings (plutil -replace ... -json '["arm64"]').
+            let _ = tokio::process::Command::new("plutil")
+                .args([
+                    "-replace",
+                    "UIRequiredDeviceCapabilities",
+                    "-json",
+                    r#"["arm64"]"#,
+                ])
+                .arg(&plist_path)
+                .output()
+                .await;
 
             // Normalize to binary plist (matches iOS path's final conversion).
             let _ = tokio::process::Command::new("plutil")
@@ -1518,9 +1581,11 @@ async fn run_sign_only_pipeline(
             {
                 let c = String::from_utf8_lossy(&o.stdout);
                 tracing::info!(
-                    "tvOS post-fix plist: PackageType_APPL={} CFBundleIcons={} DTPlatformName_appletvos={}",
+                    "tvOS post-fix plist: PackageType_APPL={} CFBundleIcons={} TVTopShelfImage={} UIRequiredDeviceCapabilities={} DTPlatformName_appletvos={}",
                     c.contains("\"CFBundlePackageType\" => \"APPL\""),
                     c.contains("CFBundleIcons"),
+                    c.contains("TVTopShelfImage"),
+                    c.contains("UIRequiredDeviceCapabilities"),
                     c.contains("\"DTPlatformName\" => \"appletvos\"")
                 );
             }
