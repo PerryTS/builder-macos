@@ -466,6 +466,8 @@ mod tests {
             android_distribute: None,
             macos_distribute: None,
             macos_encryption_exempt: None,
+            ios_info_plist: None,
+            release_notes: None,
         };
 
         let plist = generate_ios_info_plist(&manifest, None);
@@ -505,11 +507,13 @@ mod tests {
             android_distribute: None,
             macos_distribute: None,
             macos_encryption_exempt: None,
+            ios_info_plist: None,
+            release_notes: None,
         };
 
         let plist = generate_ios_info_plist(&manifest, None);
-        // Default deployment target
-        assert!(plist.contains("<string>16.0</string>"));
+        // Default deployment target (see the `unwrap_or` default in this module).
+        assert!(plist.contains("<string>17.0</string>"));
         // Default device families (both iPhone + iPad)
         assert!(plist.contains("<integer>1</integer>"));
         assert!(plist.contains("<integer>2</integer>"));

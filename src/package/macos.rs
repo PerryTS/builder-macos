@@ -348,9 +348,11 @@ mod tests {
             android_distribute: None,
             macos_distribute: None,
             macos_encryption_exempt: None,
+            ios_info_plist: None,
+            release_notes: None,
         };
 
-        let plist = generate_info_plist(&manifest, Some("AppIcon.icns"));
+        let plist = generate_info_plist(&manifest, Some("AppIcon.icns"), None);
         assert!(plist.contains("<string>MyApp</string>"));
         assert!(plist.contains("<string>com.example.myapp</string>"));
         assert!(plist.contains("<string>1.0.0</string>"));
@@ -385,9 +387,11 @@ mod tests {
             android_distribute: None,
             macos_distribute: None,
             macos_encryption_exempt: None,
+            ios_info_plist: None,
+            release_notes: None,
         };
 
-        let plist = generate_info_plist(&manifest, None);
+        let plist = generate_info_plist(&manifest, None, None);
         assert!(!plist.contains("CFBundleIconFile"));
         assert!(plist.contains("public.app-category.games"));
         assert!(plist.contains("<string>14.0</string>"));
