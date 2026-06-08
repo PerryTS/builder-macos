@@ -46,6 +46,10 @@ pub struct BuildManifest {
     pub android_permissions: Option<Vec<String>>,
     #[serde(default)]
     pub android_distribute: Option<String>,
+    /// Explicit Play `versionCode` from `perry.toml [android]`; overrides the
+    /// value derived from `version` (`build_number` → `version_to_code`).
+    #[serde(default)]
+    pub android_version_code: Option<u32>,
     /// Per-locale release notes ("What's New") for App Store / Google Play
     #[serde(default)]
     pub release_notes: Option<std::collections::HashMap<String, String>>,
