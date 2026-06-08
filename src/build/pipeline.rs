@@ -1333,26 +1333,67 @@ async fn run_sign_only_pipeline(
                 let brand = assets_dir.join("App Icon & Top Shelf Image.brandassets");
                 std::fs::create_dir_all(&brand).ok();
 
+                // Helper: write one RGB (no-alpha) PNG resized from the source
+                // icon into `dir/<filename>` at the given pixel dimensions.
+                let write_resized = |dir: &std::path::Path,
+                                     filename: &str,
+                                     w: u32,
+                                     h: u32|
+                 -> std::io::Result<()> {
+                    if let Ok(img) = image::open(&icon_path) {
+                        img.resize_exact(w, h, image::imageops::FilterType::Lanczos3)
+                            .to_rgb8()
+                            .save(dir.join(filename))
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    }
+                    Ok(())
+                };
+
+                // Build a Content.imageset / imageset Contents.json + PNGs.
+                // tvOS assets generally require BOTH @1x and @2x (Apple's App
+                // Store validation rejects a missing 2x). The App Store icon is
+                // the lone exception: it is single-resolution (1x only).
+                // `w`/`h` are the @1x pixel dimensions; @2x is double.
+                let make_imageset = |set_dir: &std::path::Path,
+                                     w: u32,
+                                     h: u32,
+                                     include_2x: bool|
+                 -> std::io::Result<()> {
+                    std::fs::create_dir_all(set_dir)?;
+                    if include_2x {
+                        std::fs::write(
+                            set_dir.join("Contents.json"),
+                            r#"{"images":[{"idiom":"tv","filename":"img@1x.png","scale":"1x"},{"idiom":"tv","filename":"img@2x.png","scale":"2x"}],"info":{"author":"xcode","version":1}}"#,
+                        )?;
+                        write_resized(set_dir, "img@1x.png", w, h)?;
+                        write_resized(set_dir, "img@2x.png", w * 2, h * 2)?;
+                    } else {
+                        std::fs::write(
+                            set_dir.join("Contents.json"),
+                            r#"{"images":[{"idiom":"tv","filename":"img@1x.png","scale":"1x"}],"info":{"author":"xcode","version":1}}"#,
+                        )?;
+                        write_resized(set_dir, "img@1x.png", w, h)?;
+                    }
+                    Ok(())
+                };
+
                 // Helper: write a 2-layer .imagestack (Back + Front), each holding
-                // a Content.imageset with one RGB (no-alpha) PNG resized from the
-                // source icon. actool rejects single-layer imagestacks
-                // ("must have at least 2 layers").
+                // a Content.imageset resized from the source icon. actool rejects
+                // single-layer imagestacks ("must have at least 2 layers").
+                // `include_2x` controls whether each layer's Content.imageset
+                // carries a @2x image in addition to @1x.
                 //
                 // returns Ok(()) on success; PNG encode/resize failures are logged.
                 let make_imagestack = |stack_dir: &std::path::Path,
                                        w: u32,
-                                       h: u32|
+                                       h: u32,
+                                       include_2x: bool|
                  -> std::io::Result<()> {
                     // imagestack Contents.json
                     std::fs::write(
                         stack_dir.join("Contents.json"),
                         r#"{"info":{"author":"xcode","version":1}}"#,
                     )?;
-                    // Resize source icon once; reuse for every layer.
-                    let resized = image::open(&icon_path).ok().map(|img| {
-                        img.resize_exact(w, h, image::imageops::FilterType::Lanczos3)
-                            .to_rgb8()
-                    });
                     // Create both required layers (Back + Front).
                     for layer_name in ["Back", "Front"] {
                         let layer =
@@ -1364,63 +1405,35 @@ async fn run_sign_only_pipeline(
                             layer.join("Contents.json"),
                             r#"{"info":{"author":"xcode","version":1}}"#,
                         )?;
-                        // Content.imageset Contents.json (single tvOS image, 1x)
-                        std::fs::write(
-                            content.join("Contents.json"),
-                            r#"{"images":[{"idiom":"tv","filename":"img.png","scale":"1x"}],"info":{"author":"xcode","version":1}}"#,
-                        )?;
-                        if let Some(ref rgb) = resized {
-                            rgb.save(content.join("img.png"))
-                                .map_err(|e| std::io::Error::other(e.to_string()))?;
-                        }
+                        // Content.imageset Contents.json + PNGs (1x [+ 2x]).
+                        make_imageset(&content, w, h, include_2x)?;
                     }
                     Ok(())
                 };
 
-                // Helper: write a flat imageset (idiom "tv", scale "1x").
-                let make_imageset = |set_dir: &std::path::Path,
-                                     w: u32,
-                                     h: u32|
-                 -> std::io::Result<()> {
-                    std::fs::create_dir_all(set_dir)?;
-                    std::fs::write(
-                        set_dir.join("Contents.json"),
-                        r#"{"images":[{"idiom":"tv","filename":"img.png","scale":"1x"}],"info":{"author":"xcode","version":1}}"#,
-                    )?;
-                    if let Ok(img) = image::open(&icon_path) {
-                        let resized =
-                            img.resize_exact(w, h, image::imageops::FilterType::Lanczos3);
-                        resized
-                            .to_rgb8()
-                            .save(set_dir.join("img.png"))
-                            .map_err(|e| std::io::Error::other(e.to_string()))?;
-                    }
-                    Ok(())
-                };
-
-                // App Icon (small) — 400x240, role: primary-app-icon (2 layers)
+                // App Icon (small) — 1x 400x240, 2x 800x480 (2 layers)
                 let app_icon = brand.join("App Icon.imagestack");
                 std::fs::create_dir_all(&app_icon).ok();
-                if let Err(e) = make_imagestack(&app_icon, 400, 240) {
+                if let Err(e) = make_imagestack(&app_icon, 400, 240, true) {
                     tracing::warn!("tvOS App Icon imagestack gen failed: {e}");
                 }
 
-                // App Icon - App Store (large) — 1280x768 (2 layers)
+                // App Icon - App Store (large) — 1280x768, 1x ONLY (2 layers)
                 let app_icon_store = brand.join("App Icon - App Store.imagestack");
                 std::fs::create_dir_all(&app_icon_store).ok();
-                if let Err(e) = make_imagestack(&app_icon_store, 1280, 768) {
+                if let Err(e) = make_imagestack(&app_icon_store, 1280, 768, false) {
                     tracing::warn!("tvOS App Store icon imagestack gen failed: {e}");
                 }
 
-                // Top Shelf Image — 1920x720 (flat imageset)
+                // Top Shelf Image — 1x 1920x720, 2x 3840x1440 (flat imageset)
                 let top_shelf = brand.join("Top Shelf Image.imageset");
-                if let Err(e) = make_imageset(&top_shelf, 1920, 720) {
+                if let Err(e) = make_imageset(&top_shelf, 1920, 720, true) {
                     tracing::warn!("tvOS Top Shelf Image gen failed: {e}");
                 }
 
-                // Top Shelf Image Wide — 2320x720 (flat imageset)
+                // Top Shelf Image Wide — 1x 2320x720, 2x 4640x1440 (flat imageset)
                 let top_shelf_wide = brand.join("Top Shelf Image Wide.imageset");
-                if let Err(e) = make_imageset(&top_shelf_wide, 2320, 720) {
+                if let Err(e) = make_imageset(&top_shelf_wide, 2320, 720, true) {
                     tracing::warn!("tvOS Top Shelf Image Wide gen failed: {e}");
                 }
 
