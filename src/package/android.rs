@@ -754,6 +754,7 @@ mod tests {
     fn sample_manifest() -> BuildManifest {
         BuildManifest {
             app_name: "TestApp".into(),
+            display_name: None,
             bundle_id: "com.example.testapp".into(),
             version: "1.0.0".into(),
             short_version: None,
@@ -794,6 +795,7 @@ mod tests {
     fn test_android_manifest_xml_no_permissions() {
         let manifest = BuildManifest {
             app_name: "TestApp".into(),
+            display_name: None,
             bundle_id: "com.example.testapp".into(),
             version: "1.0.0".into(),
             short_version: None,
@@ -833,6 +835,7 @@ mod tests {
     fn test_android_manifest_xml_with_permissions() {
         let manifest = BuildManifest {
             app_name: "MyApp".into(),
+            display_name: None,
             bundle_id: "com.example.myapp".into(),
             version: "2.0.0".into(),
             short_version: None,
@@ -873,6 +876,7 @@ mod tests {
     fn test_android_manifest_xml_fully_qualified_permission() {
         let manifest = BuildManifest {
             app_name: "App".into(),
+            display_name: None,
             bundle_id: "com.test.app".into(),
             version: "1.0.0".into(),
             short_version: None,
