@@ -208,6 +208,15 @@ fn generate_ios_info_plist(manifest: &BuildManifest, sdk_info: Option<&SdkInfo>)
         "\t<key>DTPlatformName</key>\n\t<string>iphoneos</string>".to_string()
     };
 
+    // CFBundleDisplayName — name shown under the icon on the Home Screen.
+    // Omitted when unset so the Home Screen falls back to CFBundleName (the
+    // executable stem, e.g. "bloom-jump" instead of "Bloom Jump").
+    let display_name_entry = manifest
+        .display_name
+        .as_deref()
+        .map(|n| format!("\t<key>CFBundleDisplayName</key>\n\t<string>{}</string>\n", escape_xml(n)))
+        .unwrap_or_default();
+
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -219,7 +228,7 @@ fn generate_ios_info_plist(manifest: &BuildManifest, sdk_info: Option<&SdkInfo>)
 	<string>{bundle_id}</string>
 	<key>CFBundleName</key>
 	<string>{name}</string>
-	<key>CFBundleVersion</key>
+{display_name_entry}	<key>CFBundleVersion</key>
 	<string>{version}</string>
 	<key>CFBundleShortVersionString</key>
 	<string>{short_version}</string>
@@ -445,6 +454,7 @@ mod tests {
     fn test_ios_info_plist_generation() {
         let manifest = BuildManifest {
             app_name: "MyApp".into(),
+            display_name: None,
             bundle_id: "com.example.myapp".into(),
             version: "1.0.0".into(),
             short_version: Some("1.0".into()),
@@ -487,6 +497,7 @@ mod tests {
     fn test_ios_info_plist_defaults() {
         let manifest = BuildManifest {
             app_name: "Test".into(),
+            display_name: None,
             bundle_id: "com.test".into(),
             version: "0.1.0".into(),
             short_version: None,

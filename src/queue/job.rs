@@ -7,6 +7,13 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildManifest {
     pub app_name: String,
+    /// Human-facing name shown under the icon on the Home Screen
+    /// (CFBundleDisplayName). When absent, the bundlers omit the key and the
+    /// Home Screen falls back to CFBundleName (the app_name / executable stem,
+    /// e.g. "bloom-jump" instead of "Bloom Jump"). `#[serde(default)]` keeps
+    /// older perry clients that don't send it deserializing cleanly.
+    #[serde(default)]
+    pub display_name: Option<String>,
     pub bundle_id: String,
     pub version: String,
     pub short_version: Option<String>,

@@ -212,6 +212,14 @@ fn generate_info_plist(manifest: &BuildManifest, icon_file: Option<&str>, sdk_in
         .map(|f| format!("\t<key>CFBundleIconFile</key>\n\t<string>{}</string>\n", escape_xml(f)))
         .unwrap_or_default();
 
+    // CFBundleDisplayName — name shown under the icon. Omitted when unset so the
+    // Finder/Launchpad name falls back to CFBundleName (the executable stem).
+    let display_name_entry = manifest
+        .display_name
+        .as_deref()
+        .map(|n| format!("\t<key>CFBundleDisplayName</key>\n\t<string>{}</string>\n", escape_xml(n)))
+        .unwrap_or_default();
+
     let uses_non_exempt = !manifest.macos_encryption_exempt.unwrap_or(true);
     let encryption_entry = format!(
         "\t<key>ITSAppUsesNonExemptEncryption</key>\n\t{}\n",
@@ -249,7 +257,7 @@ fn generate_info_plist(manifest: &BuildManifest, icon_file: Option<&str>, sdk_in
 	<string>{bundle_id}</string>
 	<key>CFBundleName</key>
 	<string>{name}</string>
-	<key>CFBundleVersion</key>
+{display_name_entry}	<key>CFBundleVersion</key>
 	<string>{version}</string>
 	<key>CFBundleShortVersionString</key>
 	<string>{short_version}</string>
@@ -327,6 +335,7 @@ mod tests {
     fn test_info_plist_generation() {
         let manifest = BuildManifest {
             app_name: "MyApp".into(),
+            display_name: Some("My App".into()),
             bundle_id: "com.example.myapp".into(),
             version: "1.0.0".into(),
             short_version: Some("1.0".into()),
@@ -361,12 +370,17 @@ mod tests {
         assert!(plist.contains("<string>AppIcon.icns</string>"));
         assert!(plist.contains("<string>13.0</string>"));
         assert!(plist.contains("APPL"));
+        // display_name set → CFBundleDisplayName present with the human name,
+        // while CFBundleName keeps the executable stem.
+        assert!(plist.contains("<key>CFBundleDisplayName</key>"));
+        assert!(plist.contains("<string>My App</string>"));
     }
 
     #[test]
     fn test_info_plist_no_icon() {
         let manifest = BuildManifest {
             app_name: "Test".into(),
+            display_name: None,
             bundle_id: "com.test".into(),
             version: "0.1.0".into(),
             short_version: None,
@@ -397,6 +411,8 @@ mod tests {
         assert!(!plist.contains("CFBundleIconFile"));
         assert!(plist.contains("public.app-category.games"));
         assert!(plist.contains("<string>14.0</string>"));
+        // display_name unset → no CFBundleDisplayName key (falls back to name).
+        assert!(!plist.contains("CFBundleDisplayName"));
     }
 
     #[test]
