@@ -85,6 +85,7 @@ pub async fn upload_to_appstore(
     key_id: &str,
     issuer_id: &str,
     tmpdir: &Path,
+    platform: &str,
 ) -> Result<UploadResult, String> {
     // altool looks for the key in specific directories.
     // Write it to a temporary location and pass via --apiKey flag.
@@ -103,7 +104,7 @@ pub async fn upload_to_appstore(
         .arg("-f")
         .arg(ipa_path)
         .arg("--type")
-        .arg("ios")
+        .arg(platform)
         .arg("--apiKey")
         .arg(key_id)
         .arg("--apiIssuer")
@@ -129,7 +130,7 @@ pub async fn upload_to_appstore(
         .arg("-f")
         .arg(ipa_path)
         .arg("--type")
-        .arg("ios")
+        .arg(platform)
         .arg("--apiKey")
         .arg(key_id)
         .arg("--apiIssuer")
