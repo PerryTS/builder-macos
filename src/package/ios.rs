@@ -15,6 +15,9 @@ pub struct SdkInfo {
 /// Device family constants for UIDeviceFamily
 const DEVICE_IPHONE: u8 = 1;
 const DEVICE_IPAD: u8 = 2;
+/// tvOS device family for UIDeviceFamily
+#[allow(dead_code)]
+const DEVICE_TV: u8 = 3;
 
 pub fn create_ios_app_bundle(
     manifest: &BuildManifest,
