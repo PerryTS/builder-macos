@@ -192,6 +192,10 @@ enum WorkerMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// App-level liveness ping ({"type":"heartbeat"}). Sent alongside the WS
+    /// ping so the hub (whose WS layer drops protocol ping/pong frames) can
+    /// track worker liveness and reap dead/zombie connections.
+    Heartbeat,
 }
 
 /// Get the perry compiler version.
@@ -649,6 +653,12 @@ async fn connect_and_run(config: &WorkerConfig) -> Result<(), String> {
 
                 if let Err(e) = ws_tx.send(Message::Ping(vec![].into())) {
                     return Err(format!("Failed to send ping: {e}"));
+                }
+
+                // App-level heartbeat so the hub can track liveness (it can't
+                // see WS protocol ping/pong frames) and reap dead connections.
+                if let Ok(hb) = serde_json::to_string(&WorkerMessage::Heartbeat) {
+                    let _ = ws_tx.send(Message::Text(hb.into()));
                 }
             }
         }
